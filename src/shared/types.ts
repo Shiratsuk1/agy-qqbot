@@ -56,6 +56,18 @@ export interface OutboundReply {
   replyToken?: string;
 }
 
+export type MediaKind = 'image' | 'file' | 'voice' | 'video';
+
+export interface OutboundMedia {
+  target: ReplyTarget;
+  mediaType?: MediaKind;
+  localPath?: string;
+  url?: string;
+  fileName?: string;
+  caption?: string;
+  replyToken?: string;
+}
+
 export interface BridgeSession {
   sessionKey: string;
   conversationId: string;
@@ -97,6 +109,22 @@ export interface CallbackDelegateResponse {
   error?: string;
   taskId?: string;
   acceptedAt?: number;
+}
+
+export interface CallbackMediaRequest {
+  replyToken: string;
+  mediaType?: MediaKind;
+  localPath?: string;
+  url?: string;
+  fileName?: string;
+  caption?: string;
+}
+
+export interface CallbackMediaResponse {
+  ok: boolean;
+  error?: string;
+  mediaType?: MediaKind;
+  deliveredAt?: number;
 }
 
 export interface CallbackHealthResponse {

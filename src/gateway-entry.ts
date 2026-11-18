@@ -386,6 +386,22 @@ export function createGatewayRuntime(
     onDeliverReply: async ({ target, text, replyToken }) => {
       await gateway.sendReply({ target, text, replyToken });
     },
+    ...(typeof gateway.sendMedia === 'function'
+      ? {
+          onDeliverMedia: async ({ target, mediaType, localPath, url, fileName, caption, replyToken }) => {
+            const res = await gateway.sendMedia!({
+              target,
+              ...(mediaType ? { mediaType } : {}),
+              ...(localPath ? { localPath } : {}),
+              ...(url ? { url } : {}),
+              ...(fileName ? { fileName } : {}),
+              ...(caption ? { caption } : {}),
+              replyToken,
+            });
+            return { mediaType: res.mediaType };
+          },
+        }
+      : {}),
     ...(typeof gateway.openReplyStream === 'function'
       ? {
           onOpenReplyStream: (target) => gateway.openReplyStream!(target),

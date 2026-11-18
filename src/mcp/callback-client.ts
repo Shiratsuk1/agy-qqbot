@@ -2,11 +2,14 @@ import { loadRuntimeConfig } from '../shared/config.ts';
 import type {
   CallbackDelegateRequest,
   CallbackDelegateResponse,
+  CallbackMediaRequest,
+  CallbackMediaResponse,
   CallbackReplyRequest,
   CallbackReplyResponse,
 } from '../shared/types.ts';
 import type {
   CallbackDelegateResult,
+  CallbackMediaResult,
   CallbackReplyResult,
   McpToolCallResult,
   PostCallbackReplyOptions,
@@ -511,6 +514,110 @@ export function formatQqbotDelegateToolResult(
       {
         type: 'text',
         text: response.error?.trim() || 'Failed to delegate background subagent task.',
+      },
+    ],
+    isError: true,
+  };
+}
+
+/**
+ * 向本地桥接回调服务发送图片/文件/音视频富媒体消息（POST `/media`）。
+ */
+export async function postCallbackMedia(
+  request: CallbackMediaRequest,
+  options: PostCallbackReplyOptions = {},
+): Promise<CallbackMediaResult> {
+  let replyEndpoint: ResolvedCallbackEndpoint;
+  try {
+    replyEndpoint = resolveCallbackEndpoint(options);
+  } catch (err) {
+    return {
+      ok: false,
+      endpoint: 'http://invalid-callback-endpoint/media',
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  const endpointUrl = replyEndpoint.url.replace(/\/reply$/, '/media');
+  const timeoutMs = options.timeoutMs ?? 60_000;
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetchImpl(endpointUrl, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json',
+      },
+      body: JSON.stringify(request),
+      signal: controller.signal,
+    });
+    const rawBody = await response.text();
+    let parsed: Record<string, unknown> | undefined;
+    try {
+      const json: unknown = JSON.parse(rawBody);
+      if (isPlainRecord(json)) {
+        parsed = json;
+      }
+    } catch {
+      parsed = undefined;
+    }
+
+    if (!response.ok || !parsed || parsed.ok !== true) {
+      const errMsg =
+        (parsed && typeof parsed.error === 'string' && parsed.error) ||
+        `HTTP ${response.status}`;
+      return {
+        ok: false,
+        statusCode: response.status,
+        endpoint: endpointUrl,
+        error: `Failed to send QQ media: ${errMsg}`,
+      };
+    }
+
+    return {
+      ok: true,
+      statusCode: response.status,
+      endpoint: endpointUrl,
+      ...(typeof parsed.mediaType === 'string'
+        ? { mediaType: parsed.mediaType as CallbackMediaResponse['mediaType'] }
+        : {}),
+      ...(typeof parsed.deliveredAt === 'number' ? { deliveredAt: parsed.deliveredAt } : {}),
+    };
+  } catch (err) {
+    const details = extractErrorDetails(err);
+    return {
+      ok: false,
+      endpoint: endpointUrl,
+      error: `Failed to reach media endpoint ${endpointUrl}: ${details.summary}`,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export function formatQqbotMediaToolResult(
+  response: CallbackMediaResponse | CallbackMediaResult,
+): McpToolCallResult {
+  if (response.ok) {
+    const kind = response.mediaType ? ` (${response.mediaType})` : '';
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Media${kind} delivered to QQ successfully.`,
+        },
+      ],
+    };
+  }
+  return {
+    content: [
+      {
+        type: 'text',
+        text: response.error?.trim() || 'Failed to send media to QQ.',
       },
     ],
     isError: true,

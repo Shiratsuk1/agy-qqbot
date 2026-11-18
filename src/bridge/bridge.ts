@@ -19,7 +19,11 @@ import {
 import type { AgyStreamProcessRunner } from './agy-stream-runner.ts';
 import { downloadInboundAttachments, isImageAttachment } from './attachments.ts';
 import { CallbackServer } from './callback-server.ts';
-import type { DelegateTaskParams, DeliverReplyHandler } from './callback-server.ts';
+import type {
+  DelegateTaskParams,
+  DeliverMediaHandler,
+  DeliverReplyHandler,
+} from './callback-server.ts';
 import { ReplyTokenRegistry } from './reply-tokens.ts';
 import { SessionStore, makeSessionKey } from './session-store.ts';
 import {
@@ -92,6 +96,7 @@ export interface CreateAntigravityBridgeOptions {
   replyTokens?: ReplyTokenRegistry;
   callbackServer?: CallbackServer;
   onDeliverReply?: DeliverReplyHandler;
+  onDeliverMedia?: DeliverMediaHandler;
   onOpenReplyStream?: OpenReplyStreamHandler;
   onSelfUpdate?: () => Promise<SelfUpdateResult>;
   onRestartProcess?: () => void;
@@ -204,7 +209,7 @@ export function formatStreamBridgePrompt(
     ...(message.scope === 'c2c' && extra?.delegateToken
       ? [`delegateToken: ${extra.delegateToken}`]
       : []),
-    'mode: direct-stream (Main QQ chat session: output your natural reply directly as assistant text; it streams live to QQ. Do NOT call qqbot_reply or run_command here. Use read_file / list_dir / find_by_name / grep_search for quick image or memory lookups. NEVER execute long-running, multi-step, research, coding, or file-writing tasks in this main chat session — immediately delegate them via qqbot_delegate_task using delegateToken, tell the user briefly that a background subagent is handling it, and end your turn so chat stays non-blocking.)',
+    'mode: direct-stream (Main QQ chat session: output your natural reply directly as assistant text; it streams live to QQ. Do NOT call qqbot_reply or run_command here. Use read_file / list_dir / find_by_name / grep_search for quick image or memory lookups. To send an existing local image or file back to QQ, call `qqbot_send_media` with `replyToken` set to the `delegateToken` above. NEVER execute long-running, multi-step, research, coding, or file-writing tasks in this main chat session — immediately delegate them via qqbot_delegate_task using delegateToken, tell the user briefly that a background subagent is handling it, and end your turn so chat stays non-blocking.)',
   ];
 
   const bodySegments: string[] = [];
@@ -384,12 +389,14 @@ export function createAntigravityBridge(
       `[QQ Background Autonomous Subagent — ${taskId}]`,
       `Task Title: ${params.title}`,
       `Working Directory: ${taskCwd}`,
+      `Media Token: ${params.delegateToken}`,
       ...(memoryDirs && memoryDirs.length > 0 ? [`Memory Directories: ${memoryDirs.join('; ')}`] : []),
       '',
       'Instructions:',
       '- You are an independent background subagent spawned from the main QQ chat so the main conversation remains non-blocking.',
       '- You have full autonomous tool permissions to research, read/write files, and run commands needed to complete this task thoroughly.',
       '- Do NOT call `qqbot_reply` or `qqbot_delegate_task` (your final text output will be delivered to QQ automatically by the bridge).',
+      '- If you need to send generated images, screenshots, or output files directly to QQ, call `qqbot_send_media` using `replyToken` = the `Media Token` above and `localPath` = the full local absolute path.',
       '- End with a concise, mobile-friendly summary of what you accomplished, always citing full local absolute paths (never relative paths) for any created or modified files.',
       '',
       'Task Specification:',
@@ -879,6 +886,7 @@ export function createAntigravityBridge(
       maxBodyBytes: options.maxBodyBytes,
       replyTokens,
       onDeliverReply: options.onDeliverReply,
+      onDeliverMedia: options.onDeliverMedia,
       onDelegateTask: (params) => launchDelegatedSubagent(params),
       now,
       logger,

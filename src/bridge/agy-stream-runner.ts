@@ -18,6 +18,7 @@ const DEFAULT_MAIN_CHAT_CLI_SETTINGS_JSON = JSON.stringify({
   permissions: {
     allow: [
       'mcp(antigravity-qqbot_antigravity-qqbot/qqbot_delegate_task)',
+      'mcp(antigravity-qqbot_antigravity-qqbot/qqbot_send_media)',
       'mcp(antigravity-qqbot_antigravity-qqbot/*)',
     ],
   },

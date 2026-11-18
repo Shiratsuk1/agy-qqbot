@@ -1,14 +1,23 @@
 import { StringDecoder } from 'node:string_decoder';
-import type { AppLogger, CallbackDelegateResponse, CallbackReplyResponse } from '../shared/types.ts';
+import type {
+  AppLogger,
+  CallbackDelegateResponse,
+  CallbackMediaResponse,
+  CallbackReplyResponse,
+  MediaKind,
+} from '../shared/types.ts';
 import {
   formatQqbotDelegateToolResult,
+  formatQqbotMediaToolResult,
   formatQqbotReplyToolResult,
   postCallbackDelegate,
+  postCallbackMedia,
   postCallbackReply,
 } from './callback-client.ts';
 import type {
   CreateMcpServerOptions,
   DelegateTaskFn,
+  DeliverMediaFn,
   DeliverReplyFn,
   JsonRpcErrorResponse,
   JsonRpcId,
@@ -87,6 +96,48 @@ export const QQBOT_DELEGATE_TOOL_DEFINITION: McpToolDefinition = {
       },
     },
     required: ['delegateToken', 'title', 'prompt'],
+    additionalProperties: false,
+  },
+};
+
+export const QQBOT_SEND_MEDIA_TOOL_NAME = 'qqbot_send_media';
+export const QQBOT_SEND_MEDIA_TOOL_DESCRIPTION =
+  'Send a local image, file, voice, or video directly to the active QQ chat via the local bridge.';
+
+export const QQBOT_SEND_MEDIA_TOOL_DEFINITION: McpToolDefinition = {
+  name: QQBOT_SEND_MEDIA_TOOL_NAME,
+  description: QQBOT_SEND_MEDIA_TOOL_DESCRIPTION,
+  inputSchema: {
+    type: 'object',
+    properties: {
+      replyToken: {
+        type: 'string',
+        description:
+          'The replyToken or delegateToken provided in the QQ prompt header (also passed to background subagents).',
+      },
+      localPath: {
+        type: 'string',
+        description: 'Absolute local file path to upload and send (mutually exclusive with url).',
+      },
+      url: {
+        type: 'string',
+        description: 'Public HTTP/HTTPS URL of the media to send (mutually exclusive with localPath).',
+      },
+      mediaType: {
+        type: 'string',
+        enum: ['image', 'file', 'voice', 'video'],
+        description: 'Optional media type; inferred from file extension when omitted.',
+      },
+      fileName: {
+        type: 'string',
+        description: 'Optional display file name when sending a generic file.',
+      },
+      caption: {
+        type: 'string',
+        description: 'Optional short caption text accompanying the media.',
+      },
+    },
+    required: ['replyToken'],
     additionalProperties: false,
   },
 };
@@ -179,6 +230,8 @@ export function createMcpServer(options: CreateMcpServerOptions = {}): McpServer
   };
   const deliverReply: DeliverReplyFn =
     options.deliverReply ?? ((request) => postCallbackReply(request, options.callback));
+  const deliverMedia: DeliverMediaFn =
+    options.deliverMedia ?? ((request) => postCallbackMedia(request, options.callback));
   const delegateTask: DelegateTaskFn =
     options.delegateTask ?? ((request) => postCallbackDelegate(request, options.callback));
 
@@ -275,6 +328,75 @@ export function createMcpServer(options: CreateMcpServerOptions = {}): McpServer
           formatQqbotDelegateToolResult({
             ok: false,
             error: `qqbot_delegate_task failed: ${detail}`,
+          }),
+        );
+      }
+    }
+
+    if (toolName === QQBOT_SEND_MEDIA_TOOL_NAME) {
+      if (!isPlainRecord(params.arguments)) {
+        return createErrorResponse(
+          id,
+          JSON_RPC_ERROR_CODES.INVALID_PARAMS,
+          `Invalid arguments for tool "${QQBOT_SEND_MEDIA_TOOL_NAME}": expected an object.`,
+        );
+      }
+
+      const replyToken =
+        typeof params.arguments.replyToken === 'string' ? params.arguments.replyToken.trim() : '';
+      const localPath =
+        typeof params.arguments.localPath === 'string' && params.arguments.localPath.trim()
+          ? params.arguments.localPath.trim()
+          : undefined;
+      const url =
+        typeof params.arguments.url === 'string' && params.arguments.url.trim()
+          ? params.arguments.url.trim()
+          : undefined;
+      const mediaType =
+        typeof params.arguments.mediaType === 'string' && params.arguments.mediaType.trim()
+          ? (params.arguments.mediaType.trim() as MediaKind)
+          : undefined;
+      const fileName =
+        typeof params.arguments.fileName === 'string' && params.arguments.fileName.trim()
+          ? params.arguments.fileName.trim()
+          : undefined;
+      const caption =
+        typeof params.arguments.caption === 'string' && params.arguments.caption.trim()
+          ? params.arguments.caption.trim()
+          : undefined;
+
+      if (!replyToken || (!localPath && !url) || (localPath && url)) {
+        return createErrorResponse(
+          id,
+          JSON_RPC_ERROR_CODES.INVALID_PARAMS,
+          `Invalid arguments for tool "${QQBOT_SEND_MEDIA_TOOL_NAME}": require "replyToken" and exactly one of "localPath" or "url".`,
+        );
+      }
+
+      try {
+        const outcome = await deliverMedia({
+          replyToken,
+          ...(localPath ? { localPath } : {}),
+          ...(url ? { url } : {}),
+          ...(mediaType ? { mediaType } : {}),
+          ...(fileName ? { fileName } : {}),
+          ...(caption ? { caption } : {}),
+        });
+        if (isMcpToolCallResult(outcome)) {
+          return createSuccessResponse(id, outcome);
+        }
+        return createSuccessResponse(
+          id,
+          formatQqbotMediaToolResult(outcome as CallbackMediaResponse),
+        );
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        logger.error(`qqbot_send_media threw unexpectedly: ${detail}`);
+        return createSuccessResponse(
+          id,
+          formatQqbotMediaToolResult({
+            ok: false,
+            error: `qqbot_send_media failed: ${detail}`,
           }),
         );
       }
@@ -403,7 +525,11 @@ export function createMcpServer(options: CreateMcpServerOptions = {}): McpServer
 
       case 'tools/list': {
         const result: McpToolsListResult = {
-          tools: [QQBOT_REPLY_TOOL_DEFINITION, QQBOT_DELEGATE_TOOL_DEFINITION],
+          tools: [
+            QQBOT_REPLY_TOOL_DEFINITION,
+            QQBOT_DELEGATE_TOOL_DEFINITION,
+            QQBOT_SEND_MEDIA_TOOL_DEFINITION,
+          ],
         };
         return createSuccessResponse(requestId, result);
       }

@@ -5,8 +5,11 @@ import type {
   CallbackDelegateRequest,
   CallbackDelegateResponse,
   CallbackHealthResponse,
+  CallbackMediaRequest,
+  CallbackMediaResponse,
   CallbackReplyRequest,
   CallbackReplyResponse,
+  MediaKind,
   ReplyTarget,
 } from '../shared/types.ts';
 import type { ReplyTokenRegistry } from './reply-tokens.ts';
@@ -47,6 +50,25 @@ export type DelegateTaskHandler = (
   params: DelegateTaskParams,
 ) => Promise<DelegateTaskResult> | DelegateTaskResult;
 
+export interface DeliverMediaParams {
+  target: ReplyTarget;
+  replyToken: string;
+  mediaType?: MediaKind;
+  localPath?: string;
+  url?: string;
+  fileName?: string;
+  caption?: string;
+}
+
+export interface DeliverMediaResult {
+  mediaType?: MediaKind;
+  deliveredAt?: number;
+}
+
+export type DeliverMediaHandler = (
+  params: DeliverMediaParams,
+) => Promise<void | DeliverMediaResult> | void | DeliverMediaResult;
+
 export interface CallbackServerOptions {
   host?: string;
   port?: number;
@@ -54,6 +76,7 @@ export interface CallbackServerOptions {
   replyTokens?: Pick<ReplyTokenRegistry, 'resolve'>;
   resolveReplyToken?: (replyToken: string) => ReplyTarget | undefined;
   onDeliverReply?: DeliverReplyHandler;
+  onDeliverMedia?: DeliverMediaHandler;
   onDelegateTask?: DelegateTaskHandler;
   now?: () => number;
   logger?: AppLogger;
@@ -234,6 +257,63 @@ function parseDelegatePayload(rawBody: string): CallbackDelegateRequest | { erro
   };
 }
 
+function parseMediaPayload(rawBody: string): CallbackMediaRequest | { error: string } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawBody);
+  } catch {
+    return { error: 'Invalid JSON request body' };
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { error: 'Request body must be a JSON object' };
+  }
+
+  const record = parsed as Record<string, unknown>;
+  const replyToken = typeof record.replyToken === 'string' ? record.replyToken.trim() : '';
+  if (!replyToken) {
+    return { error: 'Missing or invalid replyToken' };
+  }
+
+  const localPath =
+    typeof record.localPath === 'string' && record.localPath.trim()
+      ? record.localPath.trim()
+      : undefined;
+  const url =
+    typeof record.url === 'string' && record.url.trim() ? record.url.trim() : undefined;
+
+  if (!localPath && !url) {
+    return { error: 'Either localPath or url must be provided' };
+  }
+  if (localPath && url) {
+    return { error: 'Provide either localPath or url, not both' };
+  }
+
+  const rawMediaType = typeof record.mediaType === 'string' ? record.mediaType.trim() : '';
+  const validTypes = new Set<MediaKind>(['image', 'file', 'voice', 'video']);
+  if (rawMediaType && !validTypes.has(rawMediaType as MediaKind)) {
+    return { error: `Invalid mediaType "${rawMediaType}" (expected image|file|voice|video)` };
+  }
+
+  const fileName =
+    typeof record.fileName === 'string' && record.fileName.trim()
+      ? record.fileName.trim()
+      : undefined;
+  const caption =
+    typeof record.caption === 'string' && record.caption.trim()
+      ? record.caption.trim()
+      : undefined;
+
+  return {
+    replyToken,
+    ...(rawMediaType ? { mediaType: rawMediaType as MediaKind } : {}),
+    ...(localPath ? { localPath } : {}),
+    ...(url ? { url } : {}),
+    ...(fileName ? { fileName } : {}),
+    ...(caption ? { caption } : {}),
+  };
+}
+
 /**
  * 本地 HTTP 回调服务，严格绑定在回环/配置地址上接收来自 MCP Server 的 `qqbot_reply` 投递。
  */
@@ -243,6 +323,7 @@ export class CallbackServer {
   private readonly maxBodyBytes: number;
   private readonly resolveTokenFn: (replyToken: string) => ReplyTarget | undefined;
   private readonly onDeliverReply: DeliverReplyHandler | undefined;
+  private readonly onDeliverMedia: DeliverMediaHandler | undefined;
   private readonly onDelegateTask: DelegateTaskHandler | undefined;
   private readonly now: () => number;
   private readonly logger: AppLogger | undefined;
@@ -279,6 +360,7 @@ export class CallbackServer {
     }
 
     this.onDeliverReply = options.onDeliverReply;
+    this.onDeliverMedia = options.onDeliverMedia;
     this.onDelegateTask = options.onDelegateTask;
     this.now = options.now ?? Date.now;
     this.logger = options.logger;
@@ -451,6 +533,15 @@ export class CallbackServer {
       return;
     }
 
+    if (pathname === '/media') {
+      if (req.method !== 'POST') {
+        sendJson(res, 405, { ok: false, error: 'Method not allowed' }, { Allow: 'POST' });
+        return;
+      }
+      await this.handleMediaRequest(req, res);
+      return;
+    }
+
     sendJson(res, 404, { ok: false, error: 'Not found' });
   }
 
@@ -590,6 +681,78 @@ export class CallbackServer {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.logger?.error(`[bridge:callback] reply delivery failed: ${message}`);
+      sendJson(res, 500, { ok: false, error: message });
+    }
+  }
+
+  private async handleMediaRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    let rawBody: string;
+    try {
+      rawBody = await readJsonBodyWithLimit(req, this.maxBodyBytes);
+    } catch (err) {
+      if (err instanceof PayloadTooLargeError) {
+        sendJson(
+          res,
+          413,
+          { ok: false, error: err.message },
+          { Connection: 'close' },
+          () => {
+            req.destroy();
+          },
+        );
+        return;
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      sendJson(res, 400, { ok: false, error: message });
+      return;
+    }
+
+    const parsed = parseMediaPayload(rawBody);
+    if ('error' in parsed) {
+      sendJson(res, 400, { ok: false, error: parsed.error });
+      return;
+    }
+
+    const target = this.resolveTokenFn(parsed.replyToken);
+    if (!target) {
+      sendJson(res, 404, { ok: false, error: 'Unknown or expired replyToken' });
+      return;
+    }
+
+    if (!this.onDeliverMedia) {
+      sendJson(res, 500, { ok: false, error: 'No media delivery handler configured' });
+      return;
+    }
+
+    try {
+      const outcome = await this.onDeliverMedia({
+        target,
+        replyToken: parsed.replyToken,
+        ...(parsed.mediaType ? { mediaType: parsed.mediaType } : {}),
+        ...(parsed.localPath ? { localPath: parsed.localPath } : {}),
+        ...(parsed.url ? { url: parsed.url } : {}),
+        ...(parsed.fileName ? { fileName: parsed.fileName } : {}),
+        ...(parsed.caption ? { caption: parsed.caption } : {}),
+      });
+
+      const deliveredAt =
+        outcome && typeof outcome === 'object' && typeof outcome.deliveredAt === 'number'
+          ? outcome.deliveredAt
+          : this.now();
+      const mediaType =
+        outcome && typeof outcome === 'object' && outcome.mediaType
+          ? outcome.mediaType
+          : parsed.mediaType;
+
+      const mediaBody: CallbackMediaResponse = {
+        ok: true,
+        deliveredAt,
+        ...(mediaType ? { mediaType } : {}),
+      };
+      sendJson(res, 200, mediaBody);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger?.error(`[bridge:callback] media delivery failed: ${message}`);
       sendJson(res, 500, { ok: false, error: message });
     }
   }

@@ -19,14 +19,16 @@ import type {
   SendMessageOptions,
   MessageResponse,
 } from '@tencent-connect/qqbot-nodejs';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { platform } from 'node:os';
-import { resolve } from 'node:path';
+import { basename, extname, resolve } from 'node:path';
 import type {
   AppLogger,
   ChatScope,
   InboundAttachmentItem,
   InboundMessage,
+  MediaKind,
+  OutboundMedia,
   OutboundReply,
   ReplyTarget,
   RuntimeConfig,
@@ -58,6 +60,7 @@ export interface QqGateway {
   start(): Promise<void>;
   stop(): Promise<void>;
   sendReply(reply: OutboundReply): Promise<void>;
+  sendMedia?(media: OutboundMedia): Promise<{ mediaType: MediaKind }>;
   openReplyStream?(target: ReplyTarget, options?: { throttleMs?: number }): QqReplyStream;
   onInbound(handler: InboundHandler): () => void;
 }
@@ -75,6 +78,26 @@ export interface QqBotClient {
     content: string,
     opts?: { keyboard?: InlineKeyboard },
   ): Promise<MessageResponse>;
+  sendImage?(
+    target: SdkReplyTarget,
+    source: { url?: string; buffer?: Buffer; localPath?: string },
+    opts?: { content?: string; onProgress?: (uploaded: number, total: number) => void },
+  ): Promise<{ upload: unknown; message: MessageResponse | undefined }>;
+  sendFile?(
+    target: SdkReplyTarget,
+    source: { url?: string; buffer?: Buffer; localPath?: string },
+    opts?: { fileName?: string; content?: string; onProgress?: (uploaded: number, total: number) => void },
+  ): Promise<{ upload: unknown; message: MessageResponse | undefined }>;
+  sendVoice?(
+    target: SdkReplyTarget,
+    source: { url?: string; buffer?: Buffer; localPath?: string },
+    opts?: { onProgress?: (uploaded: number, total: number) => void },
+  ): Promise<{ upload: unknown; message: MessageResponse | undefined }>;
+  sendVideo?(
+    target: SdkReplyTarget,
+    source: { url?: string; buffer?: Buffer; localPath?: string },
+    opts?: { content?: string; onProgress?: (uploaded: number, total: number) => void },
+  ): Promise<{ upload: unknown; message: MessageResponse | undefined }>;
   sendTyping?(target: SdkReplyTarget, durationSec?: number): Promise<{ refIdx?: string }>;
   openStream?(opts: {
     target: SdkReplyTarget;
@@ -688,6 +711,85 @@ export function createQqGateway(
           }
         }
       });
+    },
+
+    async sendMedia(media: OutboundMedia): Promise<{ mediaType: MediaKind }> {
+      if (!activeBot) {
+        throw new Error('QqGateway is not started; call start() before sendMedia()');
+      }
+
+      const localPath = media.localPath?.trim();
+      const remoteUrl = media.url?.trim();
+      if (!localPath && !remoteUrl) {
+        throw new Error('sendMedia requires either localPath or url');
+      }
+      if (localPath && !existsSync(localPath)) {
+        throw new Error(`Media file does not exist: ${localPath}`);
+      }
+
+      const extSource = localPath || remoteUrl || '';
+      const cleanPath = extSource.split(/[?#]/)[0] ?? '';
+      const ext = extname(cleanPath).toLowerCase();
+      const inferredType: MediaKind =
+        media.mediaType ??
+        (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'].includes(ext)
+          ? 'image'
+          : ['.mp4', '.mov', '.webm'].includes(ext)
+            ? 'video'
+            : ['.silk', '.wav', '.mp3', '.ogg', '.amr'].includes(ext)
+              ? 'voice'
+              : 'file');
+
+      const source = localPath ? { localPath } : { url: remoteUrl! };
+      const caption = media.caption?.trim() || undefined;
+      const fileName =
+        media.fileName?.trim() || (localPath ? basename(localPath) : undefined);
+
+      const queueKey = `${media.target.scope}:${media.target.targetId}`;
+      await enqueueForTarget(queueKey, async () => {
+        const bot = activeBot;
+        if (!bot) {
+          throw new Error('QqGateway stopped while sending media');
+        }
+
+        const resolved = resolveSendTarget(media.target);
+        const sdkTarget: SdkReplyTarget = {
+          scope: media.target.scope,
+          targetId: media.target.targetId,
+          ...(resolved.msgId ? { msgId: resolved.msgId } : {}),
+        };
+
+        if (inferredType === 'image') {
+          if (typeof bot.sendImage !== 'function') {
+            throw new Error('Active QQBot client does not support sendImage');
+          }
+          await bot.sendImage(sdkTarget, source, caption ? { content: caption } : undefined);
+        } else if (inferredType === 'voice') {
+          if (typeof bot.sendVoice !== 'function') {
+            throw new Error('Active QQBot client does not support sendVoice');
+          }
+          await bot.sendVoice(sdkTarget, source);
+        } else if (inferredType === 'video') {
+          if (typeof bot.sendVideo !== 'function') {
+            throw new Error('Active QQBot client does not support sendVideo');
+          }
+          await bot.sendVideo(sdkTarget, source, caption ? { content: caption } : undefined);
+        } else {
+          if (typeof bot.sendFile !== 'function') {
+            throw new Error('Active QQBot client does not support sendFile');
+          }
+          await bot.sendFile(sdkTarget, source, {
+            ...(fileName ? { fileName } : {}),
+            ...(caption ? { content: caption } : {}),
+          });
+        }
+
+        if (resolved.limiterKey) {
+          replyLimiter.record(resolved.limiterKey);
+        }
+      });
+
+      return { mediaType: inferredType };
     },
 
     openReplyStream(target: ReplyTarget, streamOpts?: { throttleMs?: number }): QqReplyStream {

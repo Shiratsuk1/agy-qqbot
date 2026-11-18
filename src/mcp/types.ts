@@ -2,6 +2,8 @@ import type {
   AppLogger,
   CallbackDelegateRequest,
   CallbackDelegateResponse,
+  CallbackMediaRequest,
+  CallbackMediaResponse,
   CallbackReplyRequest,
   CallbackReplyResponse,
 } from '../shared/types.ts';
@@ -98,9 +100,18 @@ export interface CallbackDelegateResult extends CallbackDelegateResponse {
   endpoint: string;
 }
 
+export interface CallbackMediaResult extends CallbackMediaResponse {
+  statusCode?: number;
+  endpoint: string;
+}
+
 export type DeliverReplyFn = (
   request: CallbackReplyRequest,
 ) => Promise<CallbackReplyResponse | McpToolCallResult | void> | CallbackReplyResponse | McpToolCallResult | void;
+
+export type DeliverMediaFn = (
+  request: CallbackMediaRequest,
+) => Promise<CallbackMediaResponse | McpToolCallResult> | CallbackMediaResponse | McpToolCallResult;
 
 export type DelegateTaskFn = (
   request: CallbackDelegateRequest,
@@ -111,6 +122,7 @@ export interface CreateMcpServerOptions {
   stdout?: NodeJS.WritableStream;
   stderr?: NodeJS.WritableStream;
   deliverReply?: DeliverReplyFn;
+  deliverMedia?: DeliverMediaFn;
   delegateTask?: DelegateTaskFn;
   callback?: PostCallbackReplyOptions;
   serverInfo?: McpServerInfo;

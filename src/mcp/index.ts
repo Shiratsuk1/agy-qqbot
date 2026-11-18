@@ -1,4 +1,8 @@
-import { QQBOT_DELEGATE_TOOL_DEFINITION, QQBOT_REPLY_TOOL_DEFINITION } from './server.ts';
+import {
+  QQBOT_DELEGATE_TOOL_DEFINITION,
+  QQBOT_REPLY_TOOL_DEFINITION,
+  QQBOT_SEND_MEDIA_TOOL_DEFINITION,
+} from './server.ts';
 
 export interface McpToolSpec {
   name: string;
@@ -21,14 +25,21 @@ export function getPlannedMcpTools(): readonly McpToolSpec[] {
       description: QQBOT_DELEGATE_TOOL_DEFINITION.description,
       requiredParams: QQBOT_DELEGATE_TOOL_DEFINITION.inputSchema.required,
     },
+    {
+      name: QQBOT_SEND_MEDIA_TOOL_DEFINITION.name,
+      description: QQBOT_SEND_MEDIA_TOOL_DEFINITION.description,
+      requiredParams: QQBOT_SEND_MEDIA_TOOL_DEFINITION.inputSchema.required,
+    },
   ];
 }
 
 export {
   DEFAULT_CALLBACK_TIMEOUT_MS,
   formatQqbotDelegateToolResult,
+  formatQqbotMediaToolResult,
   formatQqbotReplyToolResult,
   postCallbackDelegate,
+  postCallbackMedia,
   postCallbackReply,
   resolveCallbackEndpoint,
 } from './callback-client.ts';
@@ -44,13 +55,18 @@ export {
   QQBOT_REPLY_TOOL_DEFINITION,
   QQBOT_REPLY_TOOL_DESCRIPTION,
   QQBOT_REPLY_TOOL_NAME,
+  QQBOT_SEND_MEDIA_TOOL_DEFINITION,
+  QQBOT_SEND_MEDIA_TOOL_DESCRIPTION,
+  QQBOT_SEND_MEDIA_TOOL_NAME,
   SUPPORTED_PROTOCOL_VERSIONS,
 } from './server.ts';
 export type {
   CallbackDelegateResult,
+  CallbackMediaResult,
   CallbackReplyResult,
   CreateMcpServerOptions,
   DelegateTaskFn,
+  DeliverMediaFn,
   DeliverReplyFn,
   JsonRpcErrorObject,
   JsonRpcErrorResponse,
