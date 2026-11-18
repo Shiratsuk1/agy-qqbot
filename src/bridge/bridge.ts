@@ -1238,7 +1238,10 @@ export function createAntigravityBridge(
               turnResult = await agyStreamClient.runStreamingTurn(streamPrompt, commonTurnOpts);
             }
 
-            await streamSink.complete(turnResult.text);
+            const outboundText =
+              turnResult.text.trim() ||
+              '⚠️ 本轮未收到模型可见文本输出（可能触发了工具权限拦截或内部异常），请重试或发送 /new 重置会话。';
+            await streamSink.complete(outboundText);
 
             return sessionStore.upsert({
               scope: message.scope,

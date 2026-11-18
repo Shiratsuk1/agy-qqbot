@@ -296,3 +296,62 @@ test('defaultWarmProcessSpawner drives a real persistent Node child process acro
     client.close();
   }
 });
+
+test('AgyStreamClient warm worker allows qqbot_delegate_task via --settings and surfaces step_update ERROR instead of empty silence', async () => {
+  const spawned: MockWarmChild[] = [];
+  const client = new AgyStreamClient({
+    executable: 'agy-mock',
+    warmSpawner: (req) => {
+      const mock = createMockWarmChild(req.args);
+      spawned.push(mock);
+      queueMicrotask(() => {
+        mock.emitStdoutJson({ event: 'init', conversation_id: 'conv-err-1' });
+      });
+      mock.handle.stdin.on('data', (chunk: Buffer | string) => {
+        const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+        if (!text.trim()) return;
+        queueMicrotask(() => {
+          mock.emitStdoutJson({
+            event: 'step_update',
+            step_update: {
+              conversation_id: 'conv-err-1',
+              step_index: 30,
+              step_type: 'tool',
+              state: 'ERROR',
+              error: 'permission check failed for mcp',
+            },
+          });
+          mock.emitStdoutJson({
+            event: 'result',
+            result: {
+              conversation_id: 'conv-err-1',
+              status: 'SUCCESS',
+              response: '',
+            },
+          });
+        });
+      });
+      return mock.handle;
+    },
+  });
+
+  try {
+    await assert.rejects(
+      () => client.runStreamingTurn('修改规则文件', { poolKey: 'err-pool' }),
+      /permission check failed for mcp/,
+    );
+    assert.equal(spawned.length, 1);
+    const settingsIdx = spawned[0]!.args.indexOf('--settings');
+    assert.ok(settingsIdx >= 0);
+    const parsedSettings = JSON.parse(spawned[0]!.args[settingsIdx + 1]!) as {
+      permissions?: { allow?: string[] };
+    };
+    assert.ok(
+      parsedSettings.permissions?.allow?.includes(
+        'mcp(antigravity-qqbot_antigravity-qqbot/qqbot_delegate_task)',
+      ),
+    );
+  } finally {
+    client.close();
+  }
+});

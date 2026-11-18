@@ -297,7 +297,11 @@ test('E2E createGatewayRuntime in agy-stream backend streams deltas live and iso
   assert.equal(finalizedText, '正在为你流式推演。');
   assert.equal(recordedArgs[0]?.includes('--conversation'), false);
   assert.ok(recordedArgs[0]?.includes('--add-dir'));
-  assert.equal(recordedArgs[0]?.includes('--settings'), false);
+  const settingsIdx = recordedArgs[0]?.indexOf('--settings') ?? -1;
+  assert.ok(settingsIdx >= 0);
+  const settingsPayload = recordedArgs[0]?.[settingsIdx + 1] ?? '';
+  assert.equal(settingsPayload.includes('nonWorkspaceFileAccessPolicy'), false);
+  assert.ok(settingsPayload.includes('qqbot_delegate_task'));
 
   // 2nd turn resumes stream-conv-777 automatically
   await bridge.dispatchInbound({

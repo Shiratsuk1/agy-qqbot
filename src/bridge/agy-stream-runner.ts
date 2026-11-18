@@ -14,6 +14,14 @@ export const DEFAULT_AGY_SUBAGENT_TIMEOUT_MS = 30 * 60 * 1000;
 export const DEFAULT_AGY_WARM_IDLE_TTL_MS = 30 * 60 * 1000;
 export const DEFAULT_AGY_MAX_WARM_WORKERS = 4;
 const MODEL_CATALOG_CACHE_TTL_MS = 5 * 60 * 1000;
+const DEFAULT_MAIN_CHAT_CLI_SETTINGS_JSON = JSON.stringify({
+  permissions: {
+    allow: [
+      'mcp(antigravity-qqbot_antigravity-qqbot/qqbot_delegate_task)',
+      'mcp(antigravity-qqbot_antigravity-qqbot/*)',
+    ],
+  },
+});
 
 export interface AgyStreamRunRequest {
   executable: string;
@@ -312,6 +320,15 @@ export function consumeAgyStreamLine(line: string, state: ParsedAgyStreamState):
     const step = obj.step_update as Record<string, unknown>;
     if (typeof step.conversation_id === 'string' && step.conversation_id.trim()) {
       state.conversationId = step.conversation_id.trim();
+    }
+
+    if (step.state === 'ERROR' || (typeof step.error === 'string' && step.error.trim())) {
+      const stepErr = typeof step.error === 'string' ? step.error.trim() : '';
+      if (stepErr) {
+        state.errorMessage = stepErr;
+      } else if (!state.errorMessage) {
+        state.errorMessage = `step ${String(step.step_type ?? 'execution')} failed`;
+      }
     }
 
     if (step.step_type === 'agent_response' && typeof step.text_delta === 'string') {
@@ -626,9 +643,15 @@ class WarmAgyWorker {
       ).trim();
       const convId = turn.parseState.conversationId || this.conversationId || '';
 
-      if (turn.parseState.resultStatus === 'ERROR' && !finalText) {
+      if ((turn.parseState.resultStatus === 'ERROR' || turn.parseState.errorMessage) && !finalText) {
         const errMsg = turn.parseState.errorMessage || 'agy returned ERROR status';
-        this.dispose();
+        if (turn.parseState.resultStatus === 'ERROR') {
+          this.dispose();
+        } else {
+          this.completedTurns += 1;
+          this.lastUsedAt = Date.now();
+          this.scheduleIdleTimer();
+        }
         turn.reject(new Error(`agy stream failed: ${errMsg}`));
         return;
       }
@@ -884,6 +907,8 @@ export class AgyStreamClient {
       '--output-format',
       'stream-json',
       '--disable-slash-commands',
+      '--settings',
+      DEFAULT_MAIN_CHAT_CLI_SETTINGS_JSON,
     ];
     if (params.conversationId?.trim()) {
       args.push('--conversation', params.conversationId.trim());
@@ -1103,6 +1128,8 @@ export class AgyStreamClient {
 
     if (options.skipPermissions) {
       args.push('--dangerously-skip-permissions');
+    } else {
+      args.push('--settings', DEFAULT_MAIN_CHAT_CLI_SETTINGS_JSON);
     }
 
     if (options.conversationId?.trim()) {
@@ -1146,7 +1173,7 @@ export class AgyStreamClient {
     const finalText = (parseState.accumulatedText.trim() || parseState.resultText?.trim() || '').trim();
     const conversationId = parseState.conversationId || options.conversationId?.trim() || '';
 
-    if (runResult.exitCode !== 0 && !finalText) {
+    if ((runResult.exitCode !== 0 || parseState.errorMessage) && !finalText) {
       const detail =
         parseState.errorMessage ||
         runResult.stderr.trim() ||

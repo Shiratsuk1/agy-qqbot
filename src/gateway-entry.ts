@@ -436,7 +436,14 @@ export function createGatewayRuntime(
       const doStart = async (): Promise<void> => {
         logger.info(`[gateway] Starting QQ Bot Gateway runtime (projectRoot=${projectRoot})`);
 
-        await bridge.start();
+        try {
+          await bridge.start();
+        } catch (err) {
+          logger.error(
+            `[gateway] Failed to start bridge: ${sanitizeErrorText(formatErrorMessage(err), secretValues)}`,
+          );
+          throw err;
+        }
         bridgeStarted = true;
         logger.info(`[gateway] Bridge callback server listening at ${bridge.getCallbackUrl()}`);
 
