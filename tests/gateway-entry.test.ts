@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -394,6 +394,52 @@ test('runGatewayEntry exits 0 on AbortSignal and exits 1 on permanent gateway di
     stderr: captureStream().stream,
   });
   assert.equal(badFlagExit, 1);
+});
+
+test('runGatewayEntry triggers debounced hot-reload exit 75 when src/*.ts changes', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'qqbot-hot-reload-'));
+  const srcDir = join(dir, 'src');
+  mkdirSync(srcDir, { recursive: true });
+  writeFileSync(join(srcDir, 'dummy.ts'), 'export const v = 1;\n', 'utf8');
+
+  const out = captureStream();
+  const err = captureStream();
+
+  try {
+    setTimeout(() => {
+      writeFileSync(join(srcDir, 'dummy.ts'), 'export const v = 2;\n', 'utf8');
+    }, 60);
+
+    const exitCode = await runGatewayEntry([], {
+      projectRoot: dir,
+      baseEnv: {},
+      installSignalHandlers: false,
+      autoReload: true,
+      autoReloadDebounceMs: 80,
+      stdout: out.stream,
+      stderr: err.stream,
+      createBridge: () => ({
+        start: async () => {},
+        stop: async () => {},
+        dispatchInbound: async () => {
+          throw new Error('unused');
+        },
+        getSession: () => undefined,
+        getCallbackUrl: () => 'http://127.0.0.1:39871',
+      }),
+      createGateway: () => ({
+        start: async () => {},
+        stop: async () => {},
+        sendReply: async () => {},
+        onInbound: () => () => {},
+      }),
+    });
+
+    assert.equal(exitCode, 75);
+    assert.match(out.read(), /triggering hot-reload restart/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // Keep InboundMessage type used cleanly

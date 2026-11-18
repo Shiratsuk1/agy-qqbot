@@ -1,4 +1,5 @@
-import { appendFileSync, mkdirSync, realpathSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, realpathSync, watch } from 'node:fs';
+import type { FSWatcher } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { GatewayDisconnect } from '@tencent-connect/qqbot-nodejs';
@@ -56,6 +57,8 @@ export interface GatewayRuntime {
 export interface RunGatewayEntryOptions extends CreateGatewayRuntimeOptions {
   signal?: AbortSignal;
   installSignalHandlers?: boolean;
+  autoReload?: boolean;
+  autoReloadDebounceMs?: number;
 }
 
 function writeLine(stream: Pick<NodeJS.WritableStream, 'write'>, text: string): void {
@@ -573,6 +576,7 @@ export async function runGatewayEntry(
 
   let shutdownRequestedBySignal = false;
   let shutdownSignalReason = '';
+  let hotReloadRequested = false;
   let stopOutcomePromise: Promise<void> | null = null;
 
   const triggerSignalStop = (reason: string): void => {
@@ -588,6 +592,55 @@ export async function runGatewayEntry(
       });
     }
   };
+
+  const watchers: FSWatcher[] = [];
+  let reloadDebounceTimer: ReturnType<typeof setTimeout> | undefined;
+  const cleanupWatchers = (): void => {
+    if (reloadDebounceTimer !== undefined) {
+      clearTimeout(reloadDebounceTimer);
+      reloadDebounceTimer = undefined;
+    }
+    for (const w of watchers) {
+      try {
+        w.close();
+      } catch {
+        // ignore close errors
+      }
+    }
+    watchers.length = 0;
+  };
+
+  const scheduleHotReload = (changedLabel: string): void => {
+    if (shutdownRequestedBySignal || hotReloadRequested || runtime.isStopped()) {
+      return;
+    }
+    if (reloadDebounceTimer !== undefined) {
+      clearTimeout(reloadDebounceTimer);
+    }
+    const debounceMs = options.autoReloadDebounceMs ?? 1_200;
+    reloadDebounceTimer = setTimeout(() => {
+      reloadDebounceTimer = undefined;
+      if (shutdownRequestedBySignal || hotReloadRequested || runtime.isStopped()) {
+        return;
+      }
+      hotReloadRequested = true;
+      cleanupWatchers();
+      logger.info(`[gateway] Detected change in ${changedLabel}; triggering hot-reload restart...`);
+      stopOutcomePromise = runtime.stop('hot-reload').catch((err) => {
+        logger.error(
+          `[gateway] Hot-reload stop failed: ${sanitizeErrorText(formatErrorMessage(err), secretValues)}`,
+        );
+      });
+    }, debounceMs);
+    reloadDebounceTimer.unref?.();
+  };
+
+  const enableAutoReload =
+    options.autoReload ??
+    (!options.stdout &&
+      !options.stderr &&
+      !options.signal &&
+      process.env.QQBOT_AUTO_RELOAD !== '0');
 
   const onSigInt = (): void => triggerSignalStop('SIGINT');
   const onSigTerm = (): void => triggerSignalStop('SIGTERM');
@@ -626,19 +679,52 @@ export async function runGatewayEntry(
       return shutdownRequestedBySignal && !runtime.hasPermanentDisconnect() ? 0 : 1;
     }
 
-    if (!shutdownRequestedBySignal && !runtime.isStopped()) {
+    if (enableAutoReload) {
+      const srcDir = join(runtime.projectRoot, 'src');
+      if (existsSync(srcDir)) {
+        try {
+          const srcWatcher = watch(srcDir, { recursive: true }, (_eventType, filename) => {
+            const name = typeof filename === 'string' ? filename : 'src';
+            if (/\.(ts|mts|js|mjs|json)$/i.test(name)) {
+              scheduleHotReload(`src/${name}`);
+            }
+          });
+          watchers.push(srcWatcher);
+        } catch {
+          // ignore watch errors on unsupported filesystems
+        }
+      }
+      const envFile = join(runtime.projectRoot, '.env');
+      if (existsSync(envFile)) {
+        try {
+          const envWatcher = watch(envFile, () => {
+            scheduleHotReload('.env');
+          });
+          watchers.push(envWatcher);
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    if (!shutdownRequestedBySignal && !hotReloadRequested && !runtime.isStopped()) {
       await runtime.waitForStop();
-    } else if (stopOutcomePromise) {
+    }
+    if (stopOutcomePromise) {
       await stopOutcomePromise;
-    } else {
+    } else if (!runtime.isStopped()) {
       await runtime.waitForStop();
     }
 
+    if (hotReloadRequested) {
+      return 75;
+    }
     if (runtime.hasPermanentDisconnect() && !shutdownRequestedBySignal) {
       return 1;
     }
     return 0;
   } finally {
+    cleanupWatchers();
     if (installSignals) {
       process.off('SIGINT', onSigInt);
       process.off('SIGTERM', onSigTerm);
