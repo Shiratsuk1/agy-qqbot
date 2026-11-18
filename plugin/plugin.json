@@ -1,0 +1,15 @@
+{
+  "name": "antigravity-qqbot",
+  "displayName": "AGY QQ Bot Bridge",
+  "description": "Connect QQ private and group chats to local Antigravity (agy) with warm 2s live streaming, multimodal vision/ASR, memory mounting, slash commands, and non-blocking background subagents.",
+  "version": "0.2.0",
+  "author": "Yuzuki Shiraishi",
+  "homepage": "https://github.com/Shiratsuk1/agy-qqbot",
+  "repository": "https://github.com/Shiratsuk1/agy-qqbot",
+  "suggestedPrompts": [
+    "Check whether the antigravity-qqbot MCP server and qqbot_reply tool are connected",
+    "Help me configure absolute paths and environment variables for the QQ Bot Bridge sidecar and MCP server",
+    "Explain how inbound [QQ c2c stream] prompts and qqbot_delegate_task work"
+  ],
+  "disabled": true
+}
