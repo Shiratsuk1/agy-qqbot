@@ -405,6 +405,11 @@ export function createGatewayRuntime(
           },
         }
       : {}),
+    ...(typeof gateway.sendTyping === 'function'
+      ? {
+          onNotifyTyping: (target, durationSec) => gateway.sendTyping!(target, durationSec),
+        }
+      : {}),
     ...(typeof gateway.openReplyStream === 'function'
       ? {
           onOpenReplyStream: (target) => gateway.openReplyStream!(target),
@@ -427,7 +432,7 @@ export function createGatewayRuntime(
       logger.error(
         `[gateway] Failed to dispatch inbound message (${message.scope}:${message.peerId}, messageId=${message.messageId}): ${safeErr}`,
       );
-      if (config.backendMode === 'agy-stream' && message.scope === 'c2c') {
+      if (message.scope === 'c2c') {
         await gateway
           .sendReply({
             target: message.replyTarget,

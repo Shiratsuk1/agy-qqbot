@@ -25,6 +25,11 @@ import type {
   DeliverReplyHandler,
 } from './callback-server.ts';
 import { ReplyTokenRegistry } from './reply-tokens.ts';
+import {
+  HandoffStore,
+  buildCompactedSessionHandoff,
+  extractAgentApiTranscriptDigest,
+} from './session-handoff.ts';
 import { SessionStore, makeSessionKey } from './session-store.ts';
 import {
   PeerPreferencesStore,
@@ -64,6 +69,7 @@ export interface FormatBridgePromptOptions {
   memoryDirs?: readonly string[];
   delegateToken?: string;
   completedSubtasks?: readonly string[];
+  handoffContext?: string;
 }
 
 export interface CreateAntigravityBridgeOptions {
@@ -72,6 +78,7 @@ export interface CreateAntigravityBridgeOptions {
   dataDir?: string;
   workspaceRoot?: string;
   memoryDirs?: readonly string[];
+  antigravityAppDataDir?: string;
   callbackHost?: string;
   callbackPort?: number;
   maxBodyBytes?: number;
@@ -97,6 +104,7 @@ export interface CreateAntigravityBridgeOptions {
   callbackServer?: CallbackServer;
   onDeliverReply?: DeliverReplyHandler;
   onDeliverMedia?: DeliverMediaHandler;
+  onNotifyTyping?: (target: ReplyTarget, durationSec?: number) => Promise<void> | void;
   onOpenReplyStream?: OpenReplyStreamHandler;
   onSelfUpdate?: () => Promise<SelfUpdateResult>;
   onRestartProcess?: () => void;
@@ -147,6 +155,16 @@ export function formatBridgePrompt(
   ];
 
   const bodySegments: string[] = [];
+  if (extra?.handoffContext?.trim()) {
+    bodySegments.push(
+      ['[Session Checkpoint / Previous Context]', extra.handoffContext.trim()].join('\n'),
+    );
+  }
+  if (extra?.completedSubtasks && extra.completedSubtasks.length > 0) {
+    bodySegments.push(
+      ['[Completed Background Subagent Reports]', ...extra.completedSubtasks].join('\n'),
+    );
+  }
   if (attachments.length > 0) {
     const hasLocalImage = attachments.some((att) => Boolean(att.localPath) && isImageAttachment(att));
     const attachmentBlock = [
@@ -283,12 +301,16 @@ export function createAntigravityBridge(
   const sessionStore = options.sessionStore ?? new SessionStore({ dataDir, logger });
   const preferencesStore =
     options.preferencesStore ?? new PeerPreferencesStore({ dataDir, logger });
+  const handoffStore = new HandoffStore({ dataDir, logger });
   const replyTokens =
     options.replyTokens ??
     new ReplyTokenRegistry({
       ttlMs: options.replyTokenTtlMs,
       now,
     });
+  const canRunCliSummarizer = Boolean(
+    options.agyStreamClient || options.agyStreamRunner || !options.runner,
+  );
   const agentApi =
     options.agentApi ??
     new AgentApiClient({
@@ -331,7 +353,58 @@ export function createAntigravityBridge(
     }
   >();
   const completedNoticesByPeer = new Map<string, string[]>();
+  const activeTypingTimers = new Map<string, ReturnType<typeof setInterval>>();
   let subtaskCounter = 0;
+
+  const stopTypingKeepAlive = (scope: ChatScope, peerId: string): void => {
+    const key = `${scope}:${peerId}`;
+    const timer = activeTypingTimers.get(key);
+    if (timer !== undefined) {
+      clearInterval(timer);
+      activeTypingTimers.delete(key);
+    }
+  };
+
+  const stopAllTypingKeepAlives = (): void => {
+    for (const timer of activeTypingTimers.values()) {
+      clearInterval(timer);
+    }
+    activeTypingTimers.clear();
+  };
+
+  const startTypingKeepAlive = (target: ReplyTarget): void => {
+    if (target.scope !== 'c2c' || target.forceProactive || !options.onNotifyTyping) {
+      return;
+    }
+    stopTypingKeepAlive(target.scope, target.targetId);
+    const fireTyping = (): void => {
+      try {
+        Promise.resolve(options.onNotifyTyping?.(target, 60)).catch(() => undefined);
+      } catch {
+        // 忽略输入状态通知异常
+      }
+    };
+    fireTyping();
+    let refreshesRemaining = 3;
+    const key = `${target.scope}:${target.targetId}`;
+    const timer = setInterval(() => {
+      if (refreshesRemaining <= 0) {
+        stopTypingKeepAlive(target.scope, target.targetId);
+        return;
+      }
+      refreshesRemaining -= 1;
+      fireTyping();
+    }, 45_000);
+    timer.unref?.();
+    activeTypingTimers.set(key, timer);
+  };
+
+  const wrappedDeliverReply: DeliverReplyHandler | undefined = options.onDeliverReply
+    ? async (params) => {
+        stopTypingKeepAlive(params.target.scope, params.target.targetId);
+        return options.onDeliverReply!(params);
+      }
+    : undefined;
 
   const deliverDirectText = async (target: ReplyTarget, text: string): Promise<void> => {
     if (options.onDeliverReply) {
@@ -364,6 +437,112 @@ export function createAntigravityBridge(
     }
     completedNoticesByPeer.delete(peerId);
     return list;
+  };
+
+  const rotateAgentApiSessionWithHandoff = async (params: {
+    sessionKey: string;
+    message: InboundMessage;
+    storeBotId: string | undefined;
+    existing: BridgeSession;
+    reason: 'compact' | 'model-switch';
+    instructions?: string;
+    targetModel?: string;
+    alwaysUseCli?: boolean;
+  }): Promise<{
+    handoffCreated: boolean;
+    usedCliSummarizer: boolean;
+    turnCount: number;
+  }> => {
+    const digest = extractAgentApiTranscriptDigest(params.existing.conversationId, {
+      appDataDir: options.antigravityAppDataDir,
+      env,
+    });
+    const prevHandoff = handoffStore.get(params.sessionKey)?.summaryText;
+    if (params.reason === 'compact' && digest.turns.length === 0 && !prevHandoff) {
+      return {
+        handoffCreated: false,
+        usedCliSummarizer: false,
+        turnCount: 0,
+      };
+    }
+
+    const botId = params.message.botId?.trim() || config.appId.trim() || undefined;
+    const { sessionDir } = ensureSessionWorkspace({
+      workspaceRoot,
+      scope: params.message.scope,
+      peerId: params.message.peerId,
+      ...(botId ? { botId } : {}),
+    });
+
+    const handoff = await buildCompactedSessionHandoff({
+      conversationId: params.existing.conversationId,
+      reason: params.reason,
+      ...(params.instructions ? { instructions: params.instructions } : {}),
+      ...(params.existing.model ? { previousModel: params.existing.model } : {}),
+      ...(params.targetModel ? { targetModel: params.targetModel } : {}),
+      ...(prevHandoff ? { existingHandoff: prevHandoff } : {}),
+      digest,
+      ...(canRunCliSummarizer
+        ? {
+            summarizeWithCli: async (summaryPrompt: string) => {
+              const summaryRes = await agyStreamClient.runStreamingTurn(summaryPrompt, {
+                cwd: sessionDir,
+                effort: 'low',
+                timeoutMs: 45_000,
+              });
+              return summaryRes.text;
+            },
+          }
+        : {}),
+      alwaysUseCli: params.alwaysUseCli,
+      logger,
+    });
+
+    if (handoff.created) {
+      handoffStore.set({
+        sessionKey: params.sessionKey,
+        reason: params.reason,
+        summaryText: handoff.summaryText,
+        sourceConversationId: params.existing.conversationId,
+        createdAt: now(),
+      });
+    }
+
+    sessionStore.delete(params.message.scope, params.message.peerId, params.storeBotId);
+    stopTypingKeepAlive(params.message.scope, params.message.peerId);
+
+    return {
+      handoffCreated: handoff.created,
+      usedCliSummarizer: handoff.usedCliSummarizer,
+      turnCount: handoff.turnCount,
+    };
+  };
+
+  const syncAgentApiSessionModelSwitch = async (params: {
+    sessionKey: string;
+    message: InboundMessage;
+    storeBotId: string | undefined;
+    existing: BridgeSession | undefined;
+    targetModel: string | undefined;
+  }): Promise<string | undefined> => {
+    if (backendMode !== 'agentapi' || !params.existing) {
+      return undefined;
+    }
+    if (params.existing.model === params.targetModel && params.existing.model !== undefined) {
+      return undefined;
+    }
+    const rot = await rotateAgentApiSessionWithHandoff({
+      sessionKey: params.sessionKey,
+      message: params.message,
+      storeBotId: params.storeBotId,
+      existing: params.existing,
+      reason: 'model-switch',
+      targetModel: params.targetModel,
+      alwaysUseCli: false,
+    });
+    return rot.handoffCreated
+      ? `（桌面模式已暂存旧会话 ${params.existing.conversationId} 的上下文摘要，下条消息将自动新建桌面会话并启用新模型）`
+      : '（桌面模式将在下条消息自动新建桌面会话并启用新模型）';
   };
 
   const launchDelegatedSubagent = (params: DelegateTaskParams): { taskId: string; acceptedAt: number } => {
@@ -507,17 +686,36 @@ export function createAntigravityBridge(
     if (slashCmd.name === 'status') {
       const catalog = await agyStreamClient.listModels();
       const prefs = preferencesStore.get(peerPrefKey);
-      const effectiveModel = prefs?.model ?? agentModel;
+      const effectiveModel =
+        backendMode === 'agentapi' && existing?.model
+          ? existing.model
+          : (prefs?.model ?? agentModel);
       const peerTasks = [...activeSubtasks.values()].filter((t) => t.peerId === message.peerId);
       const runningTurn = activeTurns.has(sessionKey);
+      const pendingHandoff = handoffStore.get(sessionKey);
 
       const statusLines = [
         '📊 当前 QQ 桥接状态',
-        `• 运行后端：${backendMode}`,
+        `• 运行后端：${backendMode}${
+          backendMode === 'agentapi' ? '（桌面端会话可见）' : '（无头实时流式）'
+        }`,
         `• 会话 ID：${existing?.conversationId ?? '（尚未建立，发送消息即自动创建）'}`,
-        `• 主对话状态：${runningTurn ? '🔄 正在生成回复中' : '🟢 空闲就绪'}`,
+        `• 主对话状态：${
+          runningTurn
+            ? '🔄 正在生成回复中'
+            : activeTypingTimers.has(`${message.scope}:${message.peerId}`)
+              ? '⏳ 桌面端处理中'
+              : '🟢 空闲就绪'
+        }`,
         `• 主对话模型：${formatModelDisplay(effectiveModel, catalog)}`,
         `• 思考强度：${prefs?.effort ?? '默认（跟随模型档位）'}`,
+        ...(pendingHandoff
+          ? [
+              `• 待继承压缩摘要：已就绪（来源 ${
+                pendingHandoff.sourceConversationId ?? '上一会话'
+              }，下条消息自动注入）`,
+            ]
+          : []),
         ...(message.scope === 'c2c'
           ? [
               `• 子智能体模型：${
@@ -573,12 +771,18 @@ export function createAntigravityBridge(
           runningTurn.controller.abort();
           cancelledMain = true;
         }
+        stopTypingKeepAlive(message.scope, message.peerId);
         for (const t of peerTasks) {
           t.controller.abort();
           activeSubtasks.delete(t.taskId);
         }
         if (!cancelledMain && peerTasks.length === 0) {
-          await deliverDirectText(message.replyTarget, 'ℹ️ 当前没有正在运行的主对话或后台子任务。');
+          await deliverDirectText(
+            message.replyTarget,
+            backendMode === 'agentapi'
+              ? 'ℹ️ 当前没有运行中的后台子任务；agentapi 模式下已送入 Antigravity 桌面端的主对话请在桌面端界面停止。'
+              : 'ℹ️ 当前没有正在运行的主对话或后台子任务。',
+          );
         } else {
           const parts: string[] = [];
           if (cancelledMain) parts.push('当前主对话轮次');
@@ -589,12 +793,18 @@ export function createAntigravityBridge(
       }
 
       if (arg === 'turn' || arg === 'main') {
+        stopTypingKeepAlive(message.scope, message.peerId);
         if (runningTurn) {
           runningTurn.abortedByUser = true;
           runningTurn.controller.abort();
           await deliverDirectText(message.replyTarget, '🛑 已终止当前正在生成的主对话轮次。');
         } else {
-          await deliverDirectText(message.replyTarget, 'ℹ️ 当前没有正在生成的主对话轮次。');
+          await deliverDirectText(
+            message.replyTarget,
+            backendMode === 'agentapi'
+              ? 'ℹ️ agentapi 模式下主对话由 Antigravity 桌面端托管，桥接层无法远程中断，请在桌面端界面点击停止。'
+              : 'ℹ️ 当前没有正在生成的主对话轮次。',
+          );
         }
         return makeSyntheticSession('slash-cancel');
       }
@@ -648,9 +858,18 @@ export function createAntigravityBridge(
             ...(updated.effort ? { effort: updated.effort } : {}),
           });
         }
+        const switchNote = await syncAgentApiSessionModelSwitch({
+          sessionKey,
+          message,
+          storeBotId,
+          existing,
+          targetModel: agentModel,
+        });
         await deliverDirectText(
           message.replyTarget,
-          `✅ 主对话模型已恢复默认：${formatModelDisplay(agentModel, catalog)}\n当前思考强度：${updated.effort ?? '默认'}`,
+          `✅ 主对话模型已恢复默认：${formatModelDisplay(agentModel, catalog)}\n当前思考强度：${updated.effort ?? '默认'}${
+            switchNote ? `\n${switchNote}` : ''
+          }`,
         );
         return makeSyntheticSession('slash-model');
       }
@@ -685,9 +904,18 @@ export function createAntigravityBridge(
             ...(updated.effort ? { effort: updated.effort } : {}),
           });
         }
+        const switchNote = await syncAgentApiSessionModelSwitch({
+          sessionKey,
+          message,
+          storeBotId,
+          existing,
+          targetModel: entry.id,
+        });
         await deliverDirectText(
           message.replyTarget,
-          `✅ 已切换主对话模型：${entry.label} [${entry.id}]\n当前思考强度：${updated.effort ?? '默认（跟随模型档位）'}`,
+          `✅ 已切换主对话模型：${entry.label} [${entry.id}]\n当前思考强度：${updated.effort ?? '默认（跟随模型档位）'}${
+            switchNote ? `\n${switchNote}` : ''
+          }`,
         );
         return makeSyntheticSession('slash-model');
       }
@@ -750,9 +978,18 @@ export function createAntigravityBridge(
             ...(effectiveModel ? { model: effectiveModel } : {}),
           });
         }
+        const switchNote = await syncAgentApiSessionModelSwitch({
+          sessionKey,
+          message,
+          storeBotId,
+          existing,
+          targetModel: updated.model ?? agentModel,
+        });
         await deliverDirectText(
           message.replyTarget,
-          `✅ 思考强度已恢复默认（跟随模型自身档位）。\n当前主对话模型：${formatModelDisplay(updated.model ?? agentModel, catalog)}`,
+          `✅ 思考强度已恢复默认（跟随模型自身档位）。\n当前主对话模型：${formatModelDisplay(updated.model ?? agentModel, catalog)}${
+            switchNote ? `\n${switchNote}` : ''
+          }`,
         );
         return makeSyntheticSession('slash-think');
       }
@@ -793,9 +1030,18 @@ export function createAntigravityBridge(
           effort,
         });
       }
+      const switchNote = await syncAgentApiSessionModelSwitch({
+        sessionKey,
+        message,
+        storeBotId,
+        existing,
+        targetModel: updated.model ?? agentModel,
+      });
       await deliverDirectText(
         message.replyTarget,
-        `✅ 思考强度已设为：${effort}\n同步对齐主模型：${formatModelDisplay(updated.model ?? agentModel, catalog)}`,
+        `✅ 思考强度已设为：${effort}\n同步对齐主模型：${formatModelDisplay(updated.model ?? agentModel, catalog)}${
+          switchNote ? `\n${switchNote}` : ''
+        }`,
       );
       return makeSyntheticSession('slash-think');
     }
@@ -885,7 +1131,7 @@ export function createAntigravityBridge(
       port: callbackPort,
       maxBodyBytes: options.maxBodyBytes,
       replyTokens,
-      onDeliverReply: options.onDeliverReply,
+      onDeliverReply: wrappedDeliverReply,
       onDeliverMedia: options.onDeliverMedia,
       onDelegateTask: (params) => launchDelegatedSubagent(params),
       now,
@@ -941,6 +1187,7 @@ export function createAntigravityBridge(
     },
 
     async stop(): Promise<void> {
+      stopAllTypingKeepAlives();
       for (const turn of activeTurns.values()) {
         turn.abortedByUser = true;
         turn.controller.abort();
@@ -1014,6 +1261,8 @@ export function createAntigravityBridge(
         if (slashCmd?.name === 'new') {
           const prev = sessionStore.get(message.scope, message.peerId, storeBotId);
           sessionStore.delete(message.scope, message.peerId, storeBotId);
+          handoffStore.delete(sessionKey);
+          stopTypingKeepAlive(message.scope, message.peerId);
           agyStreamClient.evictWarmWorker(sessionKey);
           if (message.scope === 'c2c') {
             drainCompletedNotices(message.peerId);
@@ -1063,13 +1312,61 @@ export function createAntigravityBridge(
             };
           }
           if (backendMode !== 'agy-stream') {
+            const existing = sessionStore.get(message.scope, message.peerId, storeBotId);
+            if (!existing) {
+              await deliverDirectText(
+                message.replyTarget,
+                'ℹ️ 当前没有活跃会话可供压缩，直接发送消息即可开始新对话。',
+              );
+              return {
+                sessionKey,
+                conversationId: 'none',
+                scope: message.scope,
+                peerId: message.peerId,
+                ...(storeBotId ? { botId: storeBotId } : {}),
+                workspaceDir: sessionDir,
+                lastActiveAt: now(),
+              };
+            }
+
+            if (options.onNotifyTyping) {
+              Promise.resolve(options.onNotifyTyping(message.replyTarget, 60)).catch(() => undefined);
+            }
+            const rot = await rotateAgentApiSessionWithHandoff({
+              sessionKey,
+              message,
+              storeBotId,
+              existing,
+              reason: 'compact',
+              instructions: slashCmd.args,
+              targetModel: peerPrefs?.model ?? agentModel,
+              alwaysUseCli: true,
+            });
+            if (!rot.handoffCreated) {
+              await deliverDirectText(
+                message.replyTarget,
+                `⚠️ 未能在本地读取到桌面会话（${existing.conversationId}）的对话记录，暂无法自动生成压缩交接摘要；如需继续请直接在 Antigravity 桌面端压缩，或发送 /new 开启新会话。`,
+              );
+              return {
+                sessionKey,
+                conversationId: existing.conversationId,
+                scope: message.scope,
+                peerId: message.peerId,
+                ...(storeBotId ? { botId: storeBotId } : {}),
+                workspaceDir: sessionDir,
+                lastActiveAt: now(),
+              };
+            }
+
             await deliverDirectText(
               message.replyTarget,
-              '⚠️ `/compact` 仅支持无头流式后端（`QQBOT_BACKEND=agy-stream`）。',
+              `✅ 上下文压缩检查点已生成（来源桌面会话 ${existing.conversationId}，提取 ${rot.turnCount} 条对话${
+                rot.usedCliSummarizer ? ' · 已 AI 精炼摘要' : ' · 已生成结构化摘录'
+              }）。\n下一条消息将在 AGY 桌面端开启全新轻量会话并自动注入上下文继续。`,
             );
             return {
               sessionKey,
-              conversationId: 'slash-unsupported',
+              conversationId: 'compacted-handoff',
               scope: message.scope,
               peerId: message.peerId,
               ...(storeBotId ? { botId: storeBotId } : {}),
@@ -1251,12 +1548,14 @@ export function createAntigravityBridge(
               '⚠️ 本轮未收到模型可见文本输出（可能触发了工具权限拦截或内部异常），请重试或发送 /new 重置会话。';
             await streamSink.complete(outboundText);
 
+            const activeModel = peerPrefs?.model ?? agentModel;
             return sessionStore.upsert({
               scope: message.scope,
               peerId: message.peerId,
               botId: storeBotId,
               conversationId: turnResult.conversationId,
               workspaceDir: sessionDir,
+              ...(activeModel ? { model: activeModel } : {}),
               lastActiveAt: now(),
             });
           } catch (streamErr) {
@@ -1281,22 +1580,31 @@ export function createAntigravityBridge(
         }
 
         const replyToken = replyTokens.issue(message.replyTarget);
+        const completedSubtasks =
+          message.scope === 'c2c' ? drainCompletedNotices(message.peerId) : [];
+        const pendingHandoff = handoffStore.get(sessionKey);
         const prompt = formatBridgePrompt(message, replyToken, sessionDir, {
           downloadedAttachments,
           voiceTranscripts,
           memoryDirs,
+          ...(completedSubtasks.length > 0 ? { completedSubtasks } : {}),
+          ...(pendingHandoff?.summaryText ? { handoffContext: pendingHandoff.summaryText } : {}),
         });
         const title = (options.formatTitle ? options.formatTitle(message) : defaultFormatTitle(message))?.trim();
         const existing = sessionStore.get(message.scope, message.peerId, storeBotId);
         const selectedAgentModel = peerPrefs?.model ?? agentModel;
 
+        startTypingKeepAlive(message.replyTarget);
         let conversationId: string;
+        let recordedModel = selectedAgentModel;
         if (existing) {
           try {
             await agentApi.sendMessage(existing.conversationId, prompt, { cwd: sessionDir });
             conversationId = existing.conversationId;
+            recordedModel = existing.model ?? selectedAgentModel;
           } catch (sendErr) {
             if (!fallbackOnSendError) {
+              stopTypingKeepAlive(message.scope, message.peerId);
               replyTokens.revoke(replyToken);
               throw sendErr;
             }
@@ -1312,6 +1620,7 @@ export function createAntigravityBridge(
                 cwd: sessionDir,
               });
             } catch (newErr) {
+              stopTypingKeepAlive(message.scope, message.peerId);
               replyTokens.revoke(replyToken);
               throw newErr;
             }
@@ -1324,9 +1633,14 @@ export function createAntigravityBridge(
               cwd: sessionDir,
             });
           } catch (newErr) {
+            stopTypingKeepAlive(message.scope, message.peerId);
             replyTokens.revoke(replyToken);
             throw newErr;
           }
+        }
+
+        if (pendingHandoff) {
+          handoffStore.delete(sessionKey);
         }
 
         return sessionStore.upsert({
@@ -1335,6 +1649,7 @@ export function createAntigravityBridge(
           ...(storeBotId ? { botId: storeBotId } : {}),
           conversationId,
           workspaceDir: sessionDir,
+          ...(recordedModel ? { model: recordedModel } : {}),
           lastActiveAt: now(),
         });
       });

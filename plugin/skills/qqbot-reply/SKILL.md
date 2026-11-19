@@ -52,6 +52,10 @@ Call the `qqbot_reply` tool from the `antigravity-qqbot` MCP server before finis
 - `replyToken` (string, required): exact token from the latest `[QQ ... message]` header.
 - `text` (string, required): non-empty, QQ-friendly reply text.
 
+### Proactive Media & Optional Subagent Delegation
+- To deliver generated images, screenshots, or local files directly to QQ in `[QQ ... message]` turns, call `qqbot_send_media` with `replyToken` and full `localPath` (or `url`).
+- In `[QQ c2c message]` turns, heavy background tasks can optionally be dispatched via `qqbot_delegate_task` using `delegateToken` = the header's `replyToken`, followed by a brief `qqbot_reply` status message.
+
 ### Multi-Part / Long-Running Tasks
 
 - For normal requests, call `qqbot_reply` **once** with the complete answer.

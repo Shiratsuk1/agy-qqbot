@@ -61,6 +61,7 @@ export interface QqGateway {
   stop(): Promise<void>;
   sendReply(reply: OutboundReply): Promise<void>;
   sendMedia?(media: OutboundMedia): Promise<{ mediaType: MediaKind }>;
+  sendTyping?(target: ReplyTarget, durationSec?: number): Promise<void>;
   openReplyStream?(target: ReplyTarget, options?: { throttleMs?: number }): QqReplyStream;
   onInbound(handler: InboundHandler): () => void;
 }
@@ -417,6 +418,29 @@ export function createQqGateway(
     return {
       fallbackReason: fallbackReason ?? 'no_cached_msg_id',
     };
+  };
+
+  const dispatchC2cTyping = async (
+    target: ReplyTarget,
+    durationSec: number = 60,
+    preResolvedMsgId?: string,
+  ): Promise<void> => {
+    const bot = activeBot;
+    if (!bot || target.scope !== 'c2c' || target.forceProactive || typeof bot.sendTyping !== 'function') {
+      return;
+    }
+    const resolvedMsgId =
+      preResolvedMsgId ?? target.msgId?.trim() ?? resolveSendTarget(target).msgId;
+    const effectiveSec =
+      Number.isFinite(durationSec) && durationSec > 0 ? Math.min(300, Math.round(durationSec)) : 60;
+    const typingTarget: SdkReplyTarget = {
+      scope: 'c2c',
+      targetId: target.targetId,
+      ...(resolvedMsgId ? { msgId: resolvedMsgId } : {}),
+    };
+    await bot.sendTyping(typingTarget, effectiveSec).catch((err) => {
+      logger.debug?.(`[qq:gateway] sendTyping failed (ignored): ${toError(err).message}`);
+    });
   };
 
   const dispatchInbound = async (mapped: InboundMessage): Promise<void> => {
@@ -792,6 +816,10 @@ export function createQqGateway(
       return { mediaType: inferredType };
     },
 
+    async sendTyping(target: ReplyTarget, durationSec: number = 60): Promise<void> {
+      await dispatchC2cTyping(target, durationSec);
+    },
+
     openReplyStream(target: ReplyTarget, streamOpts?: { throttleMs?: number }): QqReplyStream {
       let sdkStream: QqSdkStreamController | null = null;
       let streamBroken = false;
@@ -807,14 +835,7 @@ export function createQqGateway(
         resolvedMsgId = resolved.msgId;
         resolvedLimiterKey = resolved.limiterKey;
 
-        const typingTarget: SdkReplyTarget = {
-          scope: 'c2c',
-          targetId: target.targetId,
-          ...(resolvedMsgId ? { msgId: resolvedMsgId } : {}),
-        };
-        bot.sendTyping?.(typingTarget, 60).catch(() => {
-          // 忽略输入状态提示异常
-        });
+        void dispatchC2cTyping(target, 60, resolvedMsgId);
 
         if (resolvedMsgId && typeof bot.openStream === 'function') {
           try {

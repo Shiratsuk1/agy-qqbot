@@ -75,6 +75,7 @@ export interface BridgeSession {
   peerId: string;
   botId?: string;
   workspaceDir?: string;
+  model?: string;
   lastActiveAt: number;
 }
 

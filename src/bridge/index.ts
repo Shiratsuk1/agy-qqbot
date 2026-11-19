@@ -111,6 +111,20 @@ export type {
 export { DEFAULT_REPLY_TOKEN_TTL_MS, ReplyTokenRegistry } from './reply-tokens.ts';
 export type { ReplyTokenEntry, ReplyTokenRegistryOptions } from './reply-tokens.ts';
 
+export {
+  HandoffStore,
+  buildCompactedSessionHandoff,
+  extractAgentApiTranscriptDigest,
+  resolveAntigravityBrainDir,
+  sanitizeInboundPromptForDigest,
+} from './session-handoff.ts';
+export type {
+  HandoffBuildResult,
+  HandoffEntry,
+  TranscriptDigestResult,
+  TranscriptDigestTurn,
+} from './session-handoff.ts';
+
 export { SessionStore, makeSessionKey } from './session-store.ts';
 export type { SessionStoreOptions, SessionUpsertInput } from './session-store.ts';
 

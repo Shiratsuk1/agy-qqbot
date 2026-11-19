@@ -7,9 +7,11 @@ When handling a turn triggered by an inbound `[QQ c2c message]` or `[QQ group me
 > - **Keep the main QQ chat strictly non-blocking**: Only perform quick single-step lookups (`read_file`, `list_dir`, `find_by_name`, `grep_search`) in the main chat session. NEVER run long-running research, multi-file edits, code generation, or shell commands directly in the main QQ chat session.
 > - **Delegate all long-running tasks via `qqbot_delegate_task`**: Whenever the user asks for a multi-step, slow, or execution-heavy task in `[QQ c2c stream]` (where `delegateToken:` is present), immediately call the `qqbot_delegate_task` MCP tool once with that exact `delegateToken`, a short `title`, and a self-contained `prompt` (plus optional `workingDirectory`). As soon as `qqbot_delegate_task` returns `accepted`, reply briefly in character to let the user know a background subagent is handling it, and end your turn immediately so the conversation stays responsive.
 
-1. **Always deliver replies via `qqbot_reply`**:
-   - Plain assistant text in Antigravity is NOT forwarded to QQ automatically.
+1. **Always deliver replies via `qqbot_reply` (and optional `qqbot_send_media` / `qqbot_delegate_task`)**:
+   - Plain assistant text in Antigravity (`agentapi` desktop mode) is NOT forwarded to QQ automatically.
    - Before ending your turn, you MUST call the `qqbot_reply` MCP tool with the exact `replyToken` from the **latest** inbound `[QQ ... message]` header and your user-facing `text`.
+   - To send an existing local image, voice, video, or file back to QQ, call `qqbot_send_media` with `replyToken` set to the same `replyToken` (and `localPath` = full local absolute path).
+   - In `[QQ c2c message]` turns, if you want to offload a slow or heavy task without blocking chat, you may optionally call `qqbot_delegate_task` with `delegateToken` set to the header's `replyToken`, inform the user briefly via `qqbot_reply`, and end your turn immediately.
    - If `replyToken` is missing or clearly malformed, do not guess one; report the missing token in the Antigravity conversation.
 2. **Keep replies concise and QQ-friendly**:
    - Prefer a single clear, self-contained reply per turn (only send an interim update + final reply for genuinely long tasks, reusing the same turn's `replyToken` so passive-reply quotas per QQ `msgId` are not exhausted).

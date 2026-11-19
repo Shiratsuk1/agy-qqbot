@@ -23,7 +23,7 @@ export type ThinkingEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 export interface ModelCatalogEntry {
   id: string;
   label: string;
-  family?: 'carbon' | 'argon' | 'hydrogen' | 'flash38' | 'orchestrator' | 'claude' | 'gpt';
+  family?: 'carbon' | 'neon' | 'argon' | 'hydrogen' | 'flash38' | 'orchestrator' | 'claude' | 'gpt';
   tier?: 'low' | 'medium' | 'high' | 'xhigh';
 }
 
@@ -79,7 +79,7 @@ const EFFORT_ALIASES: Record<string, ThinkingEffort> = {
   max: 'max',
 };
 
-type TieredFamily = 'carbon' | 'argon' | 'hydrogen' | 'flash38';
+type TieredFamily = 'carbon' | 'neon' | 'argon' | 'hydrogen' | 'flash38';
 
 const FAMILY_ALIASES: Record<string, TieredFamily> = {
   '4c': 'carbon',
@@ -87,6 +87,11 @@ const FAMILY_ALIASES: Record<string, TieredFamily> = {
   carbon: 'carbon',
   'gemini-4-carbon': 'carbon',
   gemini4carbon: 'carbon',
+  '4n': 'neon',
+  n4: 'neon',
+  neon: 'neon',
+  'gemini-4-neon': 'neon',
+  gemini4neon: 'neon',
   '4a': 'argon',
   a4: 'argon',
   argon: 'argon',
@@ -126,6 +131,7 @@ const DIRECT_MODEL_ALIASES: Record<string, string> = {
 
 const FAMILY_PREFIX: Record<TieredFamily, string> = {
   carbon: 'gemini-4-carbon',
+  neon: 'gemini-4-neon',
   argon: 'gemini-4-argon',
   hydrogen: 'gemini-4-hydrogen',
   flash38: 'gemini-3.8-flash',
@@ -142,7 +148,17 @@ function resolveTierForFamily(
   desiredEffort: ThinkingEffort | undefined,
   catalog: readonly ModelCatalogEntry[],
 ): string {
-  const prefix = FAMILY_PREFIX[family];
+  const availableIds = new Set(catalog.map((c) => c.id));
+  let effectiveFamily = family;
+  const hasFamilyEntries = (fam: TieredFamily): boolean =>
+    catalog.some((c) => c.id.startsWith(`${FAMILY_PREFIX[fam]}-`));
+  if (effectiveFamily === 'carbon' && !hasFamilyEntries('carbon') && hasFamilyEntries('neon')) {
+    effectiveFamily = 'neon';
+  } else if (effectiveFamily === 'neon' && !hasFamilyEntries('neon') && hasFamilyEntries('carbon')) {
+    effectiveFamily = 'carbon';
+  }
+
+  const prefix = FAMILY_PREFIX[effectiveFamily];
   const desired = desiredEffort ?? 'medium';
 
   const tierFallbackOrder: Record<ThinkingEffort, readonly string[]> = {
@@ -153,7 +169,6 @@ function resolveTierForFamily(
     max: ['xhigh', 'high', 'medium'],
   };
 
-  const availableIds = new Set(catalog.map((c) => c.id));
   for (const tier of tierFallbackOrder[desired]) {
     const candidate = `${prefix}-${tier}`;
     if (availableIds.has(candidate)) {
@@ -171,6 +186,7 @@ export function detectModelFamilyAndTier(modelId: string | undefined): {
   const lower = modelId.trim().toLowerCase();
   const families: Array<[TieredFamily, string]> = [
     ['carbon', 'gemini-4-carbon-'],
+    ['neon', 'gemini-4-neon-'],
     ['argon', 'gemini-4-argon-'],
     ['hydrogen', 'gemini-4-hydrogen-'],
     ['flash38', 'gemini-3.8-flash-'],
@@ -186,7 +202,7 @@ export function detectModelFamilyAndTier(modelId: string | undefined): {
 }
 
 /**
- * 当用户通过 `/think` 修改思考强度时，若当前模型属于分档家族（如 4c/4a/4h/3.8f），
+ * 当用户通过 `/think` 修改思考强度时，若当前模型属于分档家族（如 4c/4n/4a/4h/3.8f），
  * 自动把模型 ID 同步对齐到该家族对应的强度变体。
  */
 export function syncModelWithEffort(
@@ -195,8 +211,10 @@ export function syncModelWithEffort(
   catalog: readonly ModelCatalogEntry[] = DEFAULT_MODEL_CATALOG,
 ): string | undefined {
   if (!currentModelId) {
-    // 默认 CLI 模型是 gemini-4-carbon 系列，直接切到对应强度的 carbon 变体更直观
-    return resolveTierForFamily('carbon', newEffort, catalog);
+    const hasCarbon = catalog.some((c) => c.id.startsWith('gemini-4-carbon-'));
+    const hasNeon = catalog.some((c) => c.id.startsWith('gemini-4-neon-'));
+    const defaultFam: TieredFamily = !hasCarbon && hasNeon ? 'neon' : 'carbon';
+    return resolveTierForFamily(defaultFam, newEffort, catalog);
   }
   const { family } = detectModelFamilyAndTier(currentModelId);
   if (!family) {
@@ -252,10 +270,26 @@ export function resolveAdaptiveModel(
     };
   }
 
-  // 3. 直接固定别名（sonnet / opus / orch 等）
+  // 3. 直接固定别名（sonnet / opus / orch 等，若旧固定 ID 不在实时目录中则自动对齐当前版本变体）
   const directId = DIRECT_MODEL_ALIASES[cleaned];
   if (directId) {
-    const entry = catalog.find((c) => c.id === directId) ?? { id: directId, label: directId };
+    let entry = catalog.find((c) => c.id === directId);
+    if (!entry) {
+      if (cleaned.includes('sonnet') || cleaned === 'cs') {
+        entry =
+          catalog.find((c) => c.id.includes('claude-sonnet') && c.id.endsWith('-medium')) ??
+          catalog.find((c) => c.id.includes('claude-sonnet'));
+      } else if (cleaned.includes('opus') || cleaned === 'co') {
+        entry =
+          catalog.find((c) => c.id.includes('claude-opus') && c.id.endsWith('-high')) ??
+          catalog.find((c) => c.id.includes('claude-opus'));
+      } else if (cleaned.includes('orch')) {
+        entry = cleaned.includes('argon') || cleaned === 'orch-a' || cleaned === '4a-orch'
+          ? catalog.find((c) => c.id.includes('orchestrator') && (c.id.includes('argon') || c.label.toLowerCase().includes('argon')))
+          : catalog.find((c) => c.id.includes('orchestrator'));
+      }
+    }
+    entry ??= { id: directId, label: directId };
     return { match: { entry } };
   }
 
@@ -304,8 +338,8 @@ export function resolveAdaptiveModel(
     }
   }
 
-  // 紧凑粘连简写（例如 `4cl`, `4cm`, `4ch`, `4hxh`）
-  const compactMatch = /^(4c|4a|4h|3\.8f|38f|3f)(xh|xhigh|low|med|medium|high|l|m|h)$/.exec(cleaned);
+  // 紧凑粘连简写（例如 `4cl`, `4cm`, `4nl`, `4ch`, `4hxh`）
+  const compactMatch = /^(4c|4n|4a|4h|3\.8f|38f|3f)(xh|xhigh|low|med|medium|high|l|m|h)$/.exec(cleaned);
   if (compactMatch?.[1] && compactMatch[2]) {
     const fam = FAMILY_ALIASES[compactMatch[1]];
     const eff = parseThinkingEffort(compactMatch[2]);
@@ -381,7 +415,11 @@ export function parseAgyModelsOutput(rawOutput: string): ModelCatalogEntry[] {
       id,
       label,
       ...(known?.family ? { family: known.family } : detected.family ? { family: detected.family } : {}),
-      ...(known?.tier ? { tier: known.tier } : {}),
+      ...(known?.tier
+        ? { tier: known.tier }
+        : detected.tier && detected.tier !== 'max'
+          ? { tier: detected.tier }
+          : {}),
     });
   }
 
@@ -582,8 +620,8 @@ export function formatModelCatalogText(
   lines.push(
     '',
     '💡 快捷切换示例：',
-    '• 家族简写：/model 4c · /model 4a · /model 4h · /model 3.8f · /model sonnet · /model opus',
-    '• 连写强度：/model 4h xhigh · /model 4c-low · /model 4al · /model gemini-4-hydrogen',
+    '• 家族简写：/model 4n (或 4c) · /model 4a · /model 4h · /model 3.8f · /model sonnet · /model opus',
+    '• 连写强度：/model 4h xhigh · /model 4n-low · /model 4al · /model gemini-4-hydrogen',
     '• 编号或重置：/model 8 · /model auto',
   );
 
@@ -595,11 +633,11 @@ export function formatSlashHelpText(): string {
     '⚙️ QQ 桥接快捷指令清单',
     '',
     '• /model [代号|编号|auto] — 查看或切换主聊天模型（别名 /m）',
-    '  自适应简写：4c (Carbon) · 4a (Argon) · 4h (Hydrogen) · 3.8f (Flash) · sonnet · opus · orch',
-    '  支持连写强度：如 /model 4h xhigh、/model 4c-low、/model 1',
+    '  自适应简写：4n/4c · 4a (Argon) · 4h (Hydrogen) · 3.8f (Flash) · sonnet · opus · orch',
+    '  支持连写强度：如 /model 4h xhigh、/model 4n-low、/model 1',
     '• /think [low|medium|high|xhigh|max] — 切换思考强度并自动对齐模型档位（别名 /t, 支持 l/m/h/xh）',
-    '• /submodel [代号|auto] — 单独指定后台子智能体模型（如主聊 4c-low 秒回，子任务 4h-high）',
-    '• /compact [保留重点] — 压缩当前会话历史上下文以释放窗口并提速',
+    '• /submodel [代号|auto] — 单独指定后台子智能体模型（如主聊 4n-low 秒回，子任务 4h-high）',
+    '• /compact [保留重点] — 压缩当前会话上下文（agy-stream 原地检查点 / agentapi 自动摘要并无缝迁移新桌面会话）',
     '• /new — 开启全新对话上下文（保留已选模型与思考强度，别名 /reset）',
     '• /status — 查看当前会话 ID、模型档位与运行中的后台子任务',
     '• /tasks & /cancel [taskId|all] — 查看或终止运行中的任务（别名 /stop）',

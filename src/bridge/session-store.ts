@@ -26,6 +26,7 @@ export interface SessionUpsertInput {
   botId?: string;
   conversationId: string;
   workspaceDir?: string;
+  model?: string;
   lastActiveAt?: number;
 }
 
@@ -66,6 +67,8 @@ function parseSessionCandidate(raw: unknown): BridgeSession | undefined {
     typeof obj.workspaceDir === 'string' && obj.workspaceDir.trim()
       ? obj.workspaceDir.trim()
       : undefined;
+  const model =
+    typeof obj.model === 'string' && obj.model.trim() ? obj.model.trim() : undefined;
   const lastActiveAt =
     typeof obj.lastActiveAt === 'number' && Number.isFinite(obj.lastActiveAt) ? obj.lastActiveAt : 0;
 
@@ -76,6 +79,7 @@ function parseSessionCandidate(raw: unknown): BridgeSession | undefined {
     peerId: obj.peerId,
     ...(botId ? { botId } : {}),
     ...(workspaceDir ? { workspaceDir } : {}),
+    ...(model ? { model } : {}),
     lastActiveAt,
   };
 }
@@ -125,6 +129,7 @@ export class SessionStore {
 
     const botId = input.botId?.trim() || undefined;
     const workspaceDir = input.workspaceDir?.trim() || undefined;
+    const model = input.model?.trim() || undefined;
     const sessionKey = makeSessionKey(input.scope, input.peerId, botId);
     const previous = this.sessions.get(sessionKey);
     const next: BridgeSession = {
@@ -134,6 +139,7 @@ export class SessionStore {
       peerId: input.peerId,
       ...(botId ? { botId } : {}),
       ...(workspaceDir ? { workspaceDir } : {}),
+      ...(model ? { model } : {}),
       lastActiveAt: input.lastActiveAt ?? Date.now(),
     };
 
