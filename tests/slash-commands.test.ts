@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -12,6 +12,7 @@ import {
   parseBridgeSlashCommand,
   parseThinkingEffort,
   resolveAdaptiveModel,
+  resolveGitExecutable,
   runRepoSelfUpdate,
   syncModelWithEffort,
 } from '../src/bridge/index.ts';
@@ -464,6 +465,127 @@ test('runRepoSelfUpdate and /update trigger git pull, plugin sync, and hot-resta
     assert.ok(replies.at(-1)?.includes('a1b2c3d → e4f5g6h'));
   } finally {
     await bridge.stop();
+    rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('resolveGitExecutable locates git via QQBOT_GIT_EXE, PATH, and standard Windows dirs', () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'qqbot-git-resolve-'));
+  const binName = process.platform === 'win32' ? 'git.exe' : 'git';
+  const emptyBaseEnv: NodeJS.ProcessEnv = {
+    PATH: '',
+    Path: '',
+    ProgramFiles: join(tempRoot, 'missing-pf'),
+    'ProgramFiles(x86)': join(tempRoot, 'missing-pf86'),
+    LOCALAPPDATA: join(tempRoot, 'missing-local'),
+    USERPROFILE: join(tempRoot, 'missing-home'),
+    ProgramData: join(tempRoot, 'missing-pdata'),
+  };
+
+  try {
+    const explicitDir = join(tempRoot, 'explicit');
+    const pathDir = join(tempRoot, 'in-path');
+    mkdirSync(explicitDir, { recursive: true });
+    mkdirSync(pathDir, { recursive: true });
+    const explicitGit = join(explicitDir, binName);
+    const pathGit = join(pathDir, binName);
+    writeFileSync(explicitGit, '');
+    writeFileSync(pathGit, '');
+
+    assert.equal(
+      resolveGitExecutable({ ...emptyBaseEnv, QQBOT_GIT_EXE: explicitGit, PATH: pathDir }),
+      explicitGit,
+    );
+    assert.equal(resolveGitExecutable({ ...emptyBaseEnv, PATH: pathDir }), pathGit);
+
+    if (process.platform === 'win32') {
+      assert.equal(resolveGitExecutable(emptyBaseEnv), null);
+
+      const pfDir = join(tempRoot, 'pf');
+      const stdGit = join(pfDir, 'Git', 'cmd', 'git.exe');
+      mkdirSync(join(pfDir, 'Git', 'cmd'), { recursive: true });
+      writeFileSync(stdGit, '');
+      assert.equal(resolveGitExecutable({ ...emptyBaseEnv, ProgramFiles: pfDir }), stdGit);
+    }
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('runRepoSelfUpdate passes explicit gitExe and falls back to GitHub archive when git is absent', async () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'qqbot-self-update-'));
+  const seenFiles: string[] = [];
+
+  try {
+    writeFileSync(
+      join(tempRoot, 'package.json'),
+      JSON.stringify({ name: 'test-fork', repository: 'https://github.com/custom/bot-fork.git' }),
+    );
+    writeFileSync(join(tempRoot, '.env'), 'QQBOT_APPID=keep-me\n');
+
+    const resExplicit = await runRepoSelfUpdate({
+      repoRoot: tempRoot,
+      gitExe: 'D:\\Tools\\Git\\cmd\\git.exe',
+      execCmd: async (file, args) => {
+        seenFiles.push(file);
+        if (args[0] === 'rev-parse') {
+          return { stdout: 'abc1234\n', stderr: '' };
+        }
+        return { stdout: '', stderr: '' };
+      },
+    });
+    assert.equal(resExplicit.updated, false);
+    assert.equal(seenFiles[0], 'D:\\Tools\\Git\\cmd\\git.exe');
+
+    const requestedUrls: string[] = [];
+    const fallbackCmds: Array<{ file: string; args: readonly string[] }> = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      requestedUrls.push(url);
+      if (url.endsWith('/commits/main')) {
+        return new Response(
+          JSON.stringify({ sha: 'deadbeef1234567', commit: { message: 'fix: archive sync\ndetails' } }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      return new Response(new Uint8Array([1, 2, 3]), { status: 200 });
+    }) as typeof fetch;
+
+    try {
+      const resFallback = await runRepoSelfUpdate({
+        repoRoot: tempRoot,
+        gitExe: '',
+        execCmd: async (file, args) => {
+          fallbackCmds.push({ file, args });
+          if (args[0] === '-xzf') {
+            const stageDir = args[3];
+            const extractedRoot = join(stageDir, 'bot-fork-main');
+            mkdirSync(join(extractedRoot, 'src'), { recursive: true });
+            writeFileSync(join(extractedRoot, 'package.json'), '{"name":"test-fork"}');
+            writeFileSync(join(extractedRoot, 'src', 'new.ts'), 'export const synced = true;\n');
+            writeFileSync(join(extractedRoot, '.env'), 'QQBOT_APPID=overwrite-attempt\n');
+          }
+          return { stdout: '', stderr: '' };
+        },
+      });
+
+      assert.deepEqual(requestedUrls, [
+        'https://api.github.com/repos/custom/bot-fork/commits/main',
+        'https://codeload.github.com/custom/bot-fork/tar.gz/refs/heads/main',
+      ]);
+      assert.equal(resFallback.updated, true);
+      assert.equal(resFallback.previousCommit, 'archive');
+      assert.equal(resFallback.currentCommit, 'deadbee');
+      assert.equal(resFallback.subject, 'fix: archive sync');
+      assert.equal(readFileSync(join(tempRoot, '.env'), 'utf8'), 'QQBOT_APPID=keep-me\n');
+      assert.equal(existsSync(join(tempRoot, 'src', 'new.ts')), true);
+      assert.ok(fallbackCmds.some((c) => c.args.includes('install')));
+      assert.ok(fallbackCmds.some((c) => c.args.includes('scripts/install-plugin.ts')));
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  } finally {
     rmSync(tempRoot, { recursive: true, force: true });
   }
 });

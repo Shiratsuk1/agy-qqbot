@@ -64,6 +64,7 @@ export {
   parseBridgeSlashCommand,
   parseThinkingEffort,
   resolveAdaptiveModel,
+  resolveGitExecutable,
   runRepoSelfUpdate,
   syncModelWithEffort,
 } from './slash-commands.ts';

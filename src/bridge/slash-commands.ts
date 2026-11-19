@@ -1,6 +1,17 @@
 import { execFile } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { delimiter, dirname, join, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { promisify } from 'node:util';
 import type { AppLogger } from '../shared/types.ts';
@@ -597,10 +608,183 @@ export function formatSlashHelpText(): string {
 }
 
 /**
- * 在源码仓库目录执行 `git pull --ff-only` 自更新，若依赖变更自动重装并同步插件清单。
+ * 解析本机 `git` 可执行文件真实路径，解决 Antigravity Desktop Sidecar
+ * 子进程 PATH 精简导致 `spawn git ENOENT` 的问题。
+ */
+export function resolveGitExecutable(env: NodeJS.ProcessEnv = process.env): string | null {
+  const explicit = env.QQBOT_GIT_EXE?.trim();
+  if (explicit && existsSync(explicit)) {
+    return explicit;
+  }
+
+  const exeNames = process.platform === 'win32' ? ['git.exe', 'git.cmd'] : ['git'];
+  const pathRaw = env.PATH ?? env.Path ?? '';
+  for (const dir of pathRaw.split(delimiter).map((d) => d.trim()).filter(Boolean)) {
+    for (const name of exeNames) {
+      const candidate = join(dir, name);
+      if (existsSync(candidate)) {
+        return candidate;
+      }
+    }
+  }
+
+  const candidates: string[] = [];
+  if (process.platform === 'win32') {
+    const programFiles = env.ProgramFiles?.trim() || 'C:\\Program Files';
+    const programFilesX86 = env['ProgramFiles(x86)']?.trim() || 'C:\\Program Files (x86)';
+    const localAppData = env.LOCALAPPDATA?.trim() || join(homedir(), 'AppData', 'Local');
+    const userHome = env.USERPROFILE?.trim() || homedir();
+    const programData = env.ProgramData?.trim() || 'C:\\ProgramData';
+    candidates.push(
+      join(programFiles, 'Git', 'cmd', 'git.exe'),
+      join(programFiles, 'Git', 'bin', 'git.exe'),
+      join(programFilesX86, 'Git', 'cmd', 'git.exe'),
+      join(localAppData, 'Programs', 'Git', 'cmd', 'git.exe'),
+      join(localAppData, 'Programs', 'Git', 'bin', 'git.exe'),
+      join(userHome, 'tools', 'git', 'cmd', 'git.exe'),
+      join(userHome, 'scoop', 'shims', 'git.exe'),
+      join(userHome, 'scoop', 'apps', 'git', 'current', 'cmd', 'git.exe'),
+      join(programData, 'chocolatey', 'bin', 'git.exe'),
+    );
+  } else {
+    candidates.push(
+      '/usr/bin/git',
+      '/usr/local/bin/git',
+      '/opt/homebrew/bin/git',
+      join(homedir(), '.local', 'bin', 'git'),
+    );
+  }
+
+  for (const c of candidates) {
+    if (existsSync(c)) {
+      return c;
+    }
+  }
+  return null;
+}
+
+function resolveNpmCommandArgs(nodeExe: string = process.execPath): {
+  file: string;
+  prefixArgs: string[];
+} {
+  const npmCli = join(dirname(nodeExe), 'node_modules', 'npm', 'bin', 'npm-cli.js');
+  if (existsSync(npmCli)) {
+    return { file: nodeExe, prefixArgs: [npmCli] };
+  }
+  const npmUnix = resolve(dirname(nodeExe), '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js');
+  if (existsSync(npmUnix)) {
+    return { file: nodeExe, prefixArgs: [npmUnix] };
+  }
+  return {
+    file: process.platform === 'win32' ? 'npm.cmd' : 'npm',
+    prefixArgs: [],
+  };
+}
+
+function parseGitHubRepoSlug(repoRoot: string): { owner: string; repo: string } | null {
+  try {
+    const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as {
+      repository?: string | { url?: string };
+    };
+    const rawUrl =
+      typeof pkg.repository === 'string' ? pkg.repository : pkg.repository?.url ?? '';
+    const match = /github\.com[:/]([^/\s]+)\/([^/\s#?.]+?)(?:\.git)?(?:[#?].*)?$/i.exec(rawUrl);
+    if (match?.[1] && match?.[2]) {
+      return { owner: match[1], repo: match[2] };
+    }
+  } catch {
+    // ignore invalid package.json
+  }
+  return null;
+}
+
+async function runArchiveSelfUpdateFallback(
+  repoRoot: string,
+  runCmd: (
+    file: string,
+    args: readonly string[],
+    cwd: string,
+  ) => Promise<{ stdout: string; stderr: string }>,
+): Promise<SelfUpdateResult> {
+  const slug = parseGitHubRepoSlug(repoRoot) ?? { owner: 'Shiratsuk1', repo: 'agy-qqbot' };
+  const apiUrl = `https://api.github.com/repos/${slug.owner}/${slug.repo}/commits/main`;
+  const commitRes = await fetch(apiUrl, {
+    headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'agy-qqbot-updater' },
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!commitRes.ok) {
+    throw new Error(`未找到本机 git 且查询 GitHub 最新版本失败 (HTTP ${commitRes.status})`);
+  }
+  const commitJson = (await commitRes.json()) as {
+    sha?: string;
+    commit?: { message?: string };
+  };
+  const remoteSha = (commitJson.sha ?? '').slice(0, 7) || 'latest';
+  const subject = (commitJson.commit?.message ?? '').split(/\r?\n/)[0]?.trim();
+
+  const tarUrl = `https://codeload.github.com/${slug.owner}/${slug.repo}/tar.gz/refs/heads/main`;
+  const tarRes = await fetch(tarUrl, {
+    headers: { 'User-Agent': 'agy-qqbot-updater' },
+    signal: AbortSignal.timeout(60_000),
+  });
+  if (!tarRes.ok) {
+    throw new Error(`下载 GitHub 更新包失败 (HTTP ${tarRes.status})`);
+  }
+  const tarBytes = Buffer.from(await tarRes.arrayBuffer());
+  const stageDir = mkdtempSync(join(tmpdir(), 'agy-qqbot-upd-'));
+  try {
+    const tgzPath = join(stageDir, 'update.tgz');
+    writeFileSync(tgzPath, tarBytes);
+    const tarExe =
+      process.platform === 'win32' && existsSync('C:\\Windows\\System32\\tar.exe')
+        ? 'C:\\Windows\\System32\\tar.exe'
+        : 'tar';
+    await runCmd(tarExe, ['-xzf', tgzPath, '-C', stageDir], stageDir);
+
+    const extractedRootName = readdirSync(stageDir).find(
+      (name) => name !== 'update.tgz' && existsSync(join(stageDir, name, 'package.json')),
+    );
+    if (!extractedRootName) {
+      throw new Error('解压 GitHub 更新包失败：未找到有效仓库根目录');
+    }
+    const extractedRoot = join(stageDir, extractedRootName);
+    const preserveNames = new Set([
+      '.env',
+      '.env.local',
+      '.qqbot-data',
+      '.git',
+      'node_modules',
+    ]);
+    for (const entryName of readdirSync(extractedRoot)) {
+      if (preserveNames.has(entryName)) continue;
+      cpSync(join(extractedRoot, entryName), join(repoRoot, entryName), {
+        recursive: true,
+        force: true,
+      });
+    }
+
+    const npmCmd = resolveNpmCommandArgs();
+    await runCmd(npmCmd.file, [...npmCmd.prefixArgs, 'install', '--no-audit', '--no-fund'], repoRoot);
+    await runCmd(process.execPath, ['scripts/install-plugin.ts'], repoRoot);
+
+    return {
+      updated: true,
+      previousCommit: 'archive',
+      currentCommit: remoteSha,
+      ...(subject ? { subject } : {}),
+    };
+  } finally {
+    rmSync(stageDir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * 在源码仓库目录执行 `git pull --ff-only` 自更新，若依赖变更自动重装并同步插件清单；
+ * 若 Sidecar 找不到 `git` 或未保留 `.git`，自动降级为从 GitHub 拉取归档安全更新。
  */
 export async function runRepoSelfUpdate(options?: {
   repoRoot?: string;
+  gitExe?: string;
   execCmd?: (
     file: string,
     args: readonly string[],
@@ -619,9 +803,15 @@ export async function runRepoSelfUpdate(options?: {
       return { stdout: String(res.stdout), stderr: String(res.stderr) };
     });
 
-  const beforeSha = (await runCmd('git', ['rev-parse', '--short', 'HEAD'], repoRoot)).stdout.trim();
-  await runCmd('git', ['pull', '--ff-only'], repoRoot);
-  const afterSha = (await runCmd('git', ['rev-parse', '--short', 'HEAD'], repoRoot)).stdout.trim();
+  const gitBin =
+    options?.gitExe ?? (options?.execCmd ? 'git' : resolveGitExecutable());
+  if (!gitBin || (!options?.execCmd && !existsSync(join(repoRoot, '.git')))) {
+    return runArchiveSelfUpdateFallback(repoRoot, runCmd);
+  }
+
+  const beforeSha = (await runCmd(gitBin, ['rev-parse', '--short', 'HEAD'], repoRoot)).stdout.trim();
+  await runCmd(gitBin, ['pull', '--ff-only'], repoRoot);
+  const afterSha = (await runCmd(gitBin, ['rev-parse', '--short', 'HEAD'], repoRoot)).stdout.trim();
 
   if (beforeSha === afterSha) {
     return {
@@ -631,18 +821,20 @@ export async function runRepoSelfUpdate(options?: {
   }
 
   const subject = (
-    await runCmd('git', ['log', '-1', '--pretty=format:%s'], repoRoot)
+    await runCmd(gitBin, ['log', '-1', '--pretty=format:%s'], repoRoot)
   ).stdout.trim();
   const changedFiles = (
-    await runCmd('git', ['diff', '--name-only', beforeSha, afterSha], repoRoot)
+    await runCmd(gitBin, ['diff', '--name-only', beforeSha, afterSha], repoRoot)
   ).stdout
     .split(/\r?\n/)
     .map((f) => f.trim())
     .filter(Boolean);
 
   if (changedFiles.some((f) => f === 'package.json' || f === 'package-lock.json')) {
-    const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-    await runCmd(npmCmd, ['install', '--no-audit', '--no-fund'], repoRoot);
+    const npmCmd = options?.execCmd
+      ? { file: process.platform === 'win32' ? 'npm.cmd' : 'npm', prefixArgs: [] as string[] }
+      : resolveNpmCommandArgs();
+    await runCmd(npmCmd.file, [...npmCmd.prefixArgs, 'install', '--no-audit', '--no-fund'], repoRoot);
   }
 
   await runCmd(process.execPath, ['scripts/install-plugin.ts'], repoRoot);
