@@ -439,6 +439,23 @@ test('qqbot_delegate_task runs background subagent with --dangerously-skip-permi
         return { exitCode: 0, stderr: '' };
       }
 
+      if (prompt.includes('后台子代理全景数据采集报告')) {
+        await req.onStdoutLine?.(
+          JSON.stringify({ event: 'init', conversation_id: 'main-conv-1' }),
+        );
+        await req.onStdoutLine?.(
+          JSON.stringify({
+            event: 'step_update',
+            step_update: {
+              step_index: 1,
+              step_type: 'agent_response',
+              text_delta: '（桑多涅审查全景报告）日记整理全景核对完毕，7篇已按规范归档。',
+            },
+          }),
+        );
+        return { exitCode: 0, stderr: '' };
+      }
+
       // Normal fast chat turn while subagent is still running!
       await req.onStdoutLine?.(
         JSON.stringify({ event: 'init', conversation_id: 'main-conv-1' }),
@@ -478,6 +495,10 @@ test('qqbot_delegate_task runs background subagent with --dangerously-skip-permi
 
   assert.equal(mainChatOutputs[0], '已派后台子工位去整理了，我们接着聊。');
   assert.equal(subagentInvocations.length, 1);
+  const subagentPrintedArg = subagentInvocations[0]?.args.find((a) => a.startsWith('--print=')) ?? '';
+  assert.match(subagentPrintedArg, /绝对禁止直接联系用户/);
+  assert.match(subagentPrintedArg, /send_message/);
+  assert.match(subagentPrintedArg, /极尽细致的全景数据采集/);
   assert.equal(pushedSubagentReplies.length, 0); // Subagent is STILL running in background!
 
   // Turn 2: While background subagent is STILL blocked on subagentGate, user sends casual chat -> ZERO blocking!
@@ -493,13 +514,22 @@ test('qqbot_delegate_task runs background subagent with --dangerously-skip-permi
   });
   assert.equal(mainChatOutputs[1], '我在呢，秒回不卡顿！');
 
-  // Now let background subagent finish -> pushes completion report to QQ!
+  // Now let background subagent finish -> reports panoramic data to main session, which organizes reply for QQ!
   releaseSubagent();
   await bridge.waitForBackgroundTasks?.();
 
-  assert.equal(pushedSubagentReplies.length, 1);
-  assert.match(pushedSubagentReplies[0] ?? '', /【后台子任务完成 · 整理本周记忆日记】/);
-  assert.match(pushedSubagentReplies[0] ?? '', /已整理完7篇日记并落盘/);
+  // Subagent NEVER pushes directly to QQ (pushedSubagentReplies remains 0, avoiding MD format breakage)
+  assert.equal(pushedSubagentReplies.length, 0);
+
+  // Main session received the panoramic report and streamed an in-character, QQ-friendly reply!
+  assert.equal(mainChatOutputs.length, 3);
+  assert.equal(mainChatOutputs[2], '（桑多涅审查全景报告）日记整理全景核对完毕，7篇已按规范归档。');
+
+  // Verify the prompt sent to the main session contained the panoramic report from the subagent
+  const reportPrompt = mainPrompts.find((p) => p.includes('后台子代理全景数据采集报告'));
+  assert.ok(reportPrompt);
+  assert.match(reportPrompt, /整理本周记忆日记/);
+  assert.match(reportPrompt, /已整理完7篇日记并落盘/);
 
   // Turn 3: Next main chat turn automatically receives [Completed Background Subagent Reports] context!
   await bridge.dispatchInbound({
@@ -512,8 +542,9 @@ test('qqbot_delegate_task runs background subagent with --dangerously-skip-permi
     receivedAt: Date.now(),
     replyTarget: { scope: 'c2c', targetId: 'u-jiaqi', msgId: 'm-after' },
   });
-  assert.match(mainPrompts[2] ?? '', /\[Completed Background Subagent Reports\]/);
-  assert.match(mainPrompts[2] ?? '', /整理本周记忆日记/);
+  const afterPrompt = mainPrompts.at(-1) ?? '';
+  assert.match(afterPrompt, /\[Completed Background Subagent Reports\]/);
+  assert.match(afterPrompt, /整理本周记忆日记/);
 
   // Verify invalid token returns 404 cleanly via postCallbackDelegate
   const badRes = await postCallbackDelegate(

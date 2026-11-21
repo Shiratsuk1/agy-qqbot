@@ -6,6 +6,10 @@ When handling a turn triggered by an inbound `[QQ c2c message]` or `[QQ group me
 > - Your assistant text streams live to QQ automatically. Output your natural reply directly as plain text and do NOT call `qqbot_reply`.
 > - **Keep the main QQ chat strictly non-blocking**: Only perform quick single-step lookups (`read_file`, `list_dir`, `find_by_name`, `grep_search`) in the main chat session. NEVER run long-running research, multi-file edits, code generation, or shell commands directly in the main QQ chat session.
 > - **Delegate all long-running tasks via `qqbot_delegate_task`**: Whenever the user asks for a multi-step, slow, or execution-heavy task in `[QQ c2c stream]` (where `delegateToken:` is present), immediately call the `qqbot_delegate_task` MCP tool once with that exact `delegateToken`, a short `title`, and a self-contained `prompt` (plus optional `workingDirectory`). As soon as `qqbot_delegate_task` returns `accepted`, reply briefly in character to let the user know a background subagent is handling it, and end your turn immediately so the conversation stays responsive.
+> - **Subagent Behavior & Reporting Protocol (子代理全景数据采集与主会话回复规约)**:
+>   - **严禁子代理直发 QQ（杜绝 Markdown 格式异常）**：后台子代理绝不准调用 `send_message`、`send message`、`qqbot_reply`、`qqbot_send_media` 或任何消息工具直接向 QQ 主人发送消息。QQ 客户端对复杂 Markdown（表格、多级嵌套、公式、大段代码等）解析受限，直发会导致严重的排版异常与格式损坏。
+>   - **极尽细致的全景数据采集**：子代理必须专注于高密度、无死角的一阶客观事实采集（真实命令完整标准输出/错误、所有产生或修改文件的本地绝对路径、代码/配置 diff、准确度量数值等），向主会话提交详尽的全景数据报告（Panoramic Data Dossier）。零占位符、零敷衍概括。
+>   - **主会话接管并组织语言回复**：子代理完成采集后，由主会话接收全景数据报告。主会话（桑多涅）全面审查技术事实，结合与旅行者（QQ主人）的聊天上下文与实际需求，以自然得体、有温度的角色语言组织回复并推送至 QQ，同时规避生硬破损的 Markdown 结构，确保移动端排版清晰优雅。
 
 1. **Always deliver replies via `qqbot_reply` (and optional `qqbot_send_media` / `qqbot_delegate_task`)**:
    - Plain assistant text in Antigravity (`agentapi` desktop mode) is NOT forwarded to QQ automatically.

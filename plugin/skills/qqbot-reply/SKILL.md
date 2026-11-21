@@ -52,9 +52,10 @@ Call the `qqbot_reply` tool from the `antigravity-qqbot` MCP server before finis
 - `replyToken` (string, required): exact token from the latest `[QQ ... message]` header.
 - `text` (string, required): non-empty, QQ-friendly reply text.
 
-### Proactive Media & Optional Subagent Delegation
+### Proactive Media & Autonomous Subagent Delegation
 - To deliver generated images, screenshots, or local files directly to QQ in `[QQ ... message]` turns, call `qqbot_send_media` with `replyToken` and full `localPath` (or `url`).
-- In `[QQ c2c message]` turns, heavy background tasks can optionally be dispatched via `qqbot_delegate_task` using `delegateToken` = the header's `replyToken`, followed by a brief `qqbot_reply` status message.
+- In `[QQ c2c stream]` and `[QQ c2c message]` turns, heavy background tasks can be dispatched via `qqbot_delegate_task` using `delegateToken` = the header's `delegateToken` / `replyToken`, followed by a brief in-character status reply.
+- **Subagent Reporting Protocol**: Autonomous background subagents are internal workers reporting exclusively to the Main Session. Subagents MUST NOT call `send_message`, `send message`, `qqbot_reply`, or `qqbot_send_media` directly to the QQ user to prevent Markdown formatting anomalies. Instead, subagents collect exhaustive panoramic data (stdout/stderr, absolute file paths, diffs, metrics) and submit the complete dossier to the Main Session. The Main Session receives the dossier, organizes an in-character, QQ-friendly reply according to the user's needs, and delivers it cleanly.
 
 ### Multi-Part / Long-Running Tasks
 

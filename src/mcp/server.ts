@@ -68,7 +68,7 @@ export const QQBOT_REPLY_TOOL_DEFINITION: McpToolDefinition = {
 
 export const QQBOT_DELEGATE_TOOL_NAME = 'qqbot_delegate_task';
 export const QQBOT_DELEGATE_TOOL_DESCRIPTION =
-  'Dispatch a long-running or multi-step task (research, coding, file organization, shell execution) to an autonomous background subagent so the main QQ chat stays non-blocking and responsive. Returns immediately with a taskId; the subagent pushes its final report directly to QQ upon completion.';
+  'Dispatch a long-running or multi-step task (research, coding, file organization, shell execution) to an autonomous background subagent so the main QQ chat stays non-blocking and responsive. Returns immediately with a taskId; upon completion, the subagent submits an exhaustive panoramic data collection report to the main session, and the main session organizes the final QQ-friendly reply.';
 
 export const QQBOT_DELEGATE_TOOL_DEFINITION: McpToolDefinition = {
   name: QQBOT_DELEGATE_TOOL_NAME,

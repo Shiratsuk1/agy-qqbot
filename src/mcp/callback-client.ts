@@ -504,7 +504,7 @@ export function formatQqbotDelegateToolResult(
       content: [
         {
           type: 'text',
-          text: `Background subagent task accepted${idLabel}. It is now running asynchronously in the background and will push its report to QQ when finished. Reply briefly to the user now and end your turn without waiting.`,
+          text: `Background subagent task accepted${idLabel}. It is now running asynchronously in the background. It will perform exhaustive panoramic data collection and report to the main session, which will organize the reply for QQ. Reply briefly to the user now and end your turn without waiting.`,
         },
       ],
     };

@@ -354,7 +354,21 @@ export function createAntigravityBridge(
   >();
   const completedNoticesByPeer = new Map<string, string[]>();
   const activeTypingTimers = new Map<string, ReturnType<typeof setInterval>>();
+  const dispatchQueues = new Map<string, Promise<unknown>>();
   let subtaskCounter = 0;
+
+  function runSerialized<T>(key: string, task: () => Promise<T>): Promise<T> {
+    const previous = dispatchQueues.get(key) ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(task);
+    const tail = current.catch(() => undefined);
+    dispatchQueues.set(key, tail);
+    void tail.finally(() => {
+      if (dispatchQueues.get(key) === tail) {
+        dispatchQueues.delete(key);
+      }
+    });
+    return current;
+  }
 
   const stopTypingKeepAlive = (scope: ChatScope, peerId: string): void => {
     const key = `${scope}:${peerId}`;
@@ -545,6 +559,240 @@ export function createAntigravityBridge(
       : '（桌面模式将在下条消息自动新建桌面会话并启用新模型）';
   };
 
+  const reportSubagentResultToMainSession = async (params: {
+    target: ReplyTarget;
+    taskId: string;
+    title: string;
+    success: boolean;
+    report: string;
+    error?: string;
+  }): Promise<void> => {
+    const rawBotId = config.appId.trim() || undefined;
+    const storeBotId = backendMode === 'agy-stream' ? `${rawBotId ?? 'default'}@stream` : rawBotId;
+    const existing =
+      sessionStore.get('c2c', params.target.targetId, storeBotId) ??
+      sessionStore
+        .list()
+        .find(
+          (s) =>
+            s.scope === 'c2c' &&
+            s.peerId === params.target.targetId &&
+            (backendMode === 'agy-stream' ? s.botId?.endsWith('@stream') : !s.botId?.endsWith('@stream')),
+        );
+    const effectiveBotId = existing?.botId ?? storeBotId;
+    const sessionKey = existing?.sessionKey ?? makeSessionKey('c2c', params.target.targetId, effectiveBotId);
+    const botId = existing?.botId?.replace(/@stream$/, '') || rawBotId;
+
+    return runSerialized(sessionKey, async () => {
+      const { sessionDir } = ensureSessionWorkspace({
+        workspaceRoot,
+        scope: 'c2c',
+        peerId: params.target.targetId,
+        ...(botId ? { botId } : {}),
+      });
+      const peerPrefKey = `c2c:${params.target.targetId}`;
+      const peerPrefs = preferencesStore.get(peerPrefKey);
+      const addDirs = memoryDirs ?? [];
+
+      const reportBlock = params.success
+        ? [
+            `[后台子代理全景数据采集报告 — ${params.title}]`,
+            `任务标识: ${params.taskId}`,
+            `执行状态: 采集成功完成`,
+            '',
+            `【全景数据采集汇报内容】`,
+            params.report,
+            '',
+            `【主会话组织语言回复指示】`,
+            `后台子代理已对「${params.title}」完成全景数据采集，全部一阶技术数据与事实已呈报如上。`,
+            `现在请主会话（桑多涅）接手：`,
+            `1. 仔细阅读并消化上述全景采集数据与客观事实；`,
+            `2. 结合与旅行者（QQ主人）的日常聊天上下文，根据需求组织自然得体、有温度的角色语言进行回复；`,
+            `3. 严格适配手机QQ排版：严禁子代理向用户直接发送Markdown。QQ客户端对复杂Markdown排版（如复杂表格、公式、嵌套语法等）支持受限，容易导致排版异常与乱码。请将技术成果用优雅、精炼、易读的自然语言或简短列表呈现，提及本地文件时必须保留完整本地绝对路径，避免输出生硬未解析的Markdown结构。`,
+          ].join('\n')
+        : [
+            `[后台子代理执行异常报告 — ${params.title}]`,
+            `任务标识: ${params.taskId}`,
+            `执行状态: 执行异常中断`,
+            `异常详情: ${params.error ?? '未知错误'}`,
+            '',
+            `【主会话组织语言回复指示】`,
+            `后台子工位在执行「${params.title}」时遇到异常，请以主会话角色语气向旅行者说明情况与问题根因，保持得体从容。`,
+          ].join('\n');
+
+      if (backendMode === 'agy-stream') {
+        const delegateToken = replyTokens.issue(params.target);
+        const headerLines = [
+          `[QQ c2c stream]`,
+          ...(botId ? [`botId: ${botId}`] : []),
+          `peerId: ${params.target.targetId}`,
+          `sender: 系统/子工位汇报 (system)`,
+          `workspace: ${sessionDir}`,
+          ...(addDirs.length > 0 ? [`memoryDirs: ${addDirs.join('; ')}`] : []),
+          `delegateToken: ${delegateToken}`,
+          'mode: direct-stream (Main QQ chat session: output your natural reply directly as assistant text; it streams live to QQ. Do NOT call qqbot_reply or run_command here. Use read_file / list_dir / find_by_name / grep_search for quick image or memory lookups. To send an existing local image or file back to QQ, call `qqbot_send_media` with `replyToken` set to the `delegateToken` above. Organize your response based on the subagent panoramic report below, keeping the reply natural, in-character, and mobile-friendly for QQ without markdown format anomalies.)',
+        ];
+        const streamPrompt = `${headerLines.join('\n')}\n\n${reportBlock}`;
+
+        const turnEntry = {
+          controller: new AbortController(),
+          abortedByUser: false,
+        };
+        activeTurns.set(sessionKey, turnEntry);
+
+        const streamSink: ReplyStreamSink = options.onOpenReplyStream
+          ? options.onOpenReplyStream(params.target)
+          : {
+              async update(): Promise<void> {},
+              async complete(finalText: string): Promise<void> {
+                if (finalText.trim() && options.onDeliverReply) {
+                  await options.onDeliverReply({
+                    replyToken: 'agy-stream-direct',
+                    target: params.target,
+                    text: finalText,
+                  });
+                }
+              },
+              cancel(): void {},
+            };
+
+        const commonTurnOpts = {
+          poolKey: sessionKey,
+          cwd: sessionDir,
+          addDirs,
+          ...(peerPrefs?.model ? { model: peerPrefs.model } : {}),
+          ...(peerPrefs?.effort ? { effort: peerPrefs.effort } : {}),
+          signal: turnEntry.controller.signal,
+          onTextProgress: async (fullText: string) => {
+            await streamSink.update(fullText);
+          },
+        };
+
+        try {
+          let turnResult: AgyTurnResult;
+          if (existing) {
+            try {
+              turnResult = await agyStreamClient.runStreamingTurn(streamPrompt, {
+                ...commonTurnOpts,
+                conversationId: existing.conversationId,
+              });
+            } catch (resumeErr) {
+              if (!fallbackOnSendError || turnEntry.abortedByUser) {
+                throw resumeErr;
+              }
+              logger?.warn(
+                `[bridge:agy-stream] Resume failed for ${sessionKey} (${existing.conversationId}), starting fresh conversation: ${
+                  resumeErr instanceof Error ? resumeErr.message : String(resumeErr)
+                }`,
+              );
+              turnResult = await agyStreamClient.runStreamingTurn(streamPrompt, commonTurnOpts);
+            }
+          } else {
+            turnResult = await agyStreamClient.runStreamingTurn(streamPrompt, commonTurnOpts);
+          }
+
+          const outboundText = turnResult.text.trim();
+          if (outboundText) {
+            await streamSink.complete(outboundText);
+          }
+
+          const activeModel = peerPrefs?.model ?? agentModel;
+          sessionStore.upsert({
+            scope: 'c2c',
+            peerId: params.target.targetId,
+            botId: storeBotId,
+            conversationId: turnResult.conversationId,
+            workspaceDir: sessionDir,
+            ...(activeModel ? { model: activeModel } : {}),
+            lastActiveAt: now(),
+          });
+        } catch (err) {
+          streamSink.cancel();
+          if (!turnEntry.abortedByUser) {
+            logger?.error(
+              `[bridge:agy-stream] Failed to stream subagent report response: ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+            );
+          }
+        } finally {
+          if (activeTurns.get(sessionKey) === turnEntry) {
+            activeTurns.delete(sessionKey);
+          }
+        }
+        return;
+      }
+
+      // agentapi mode
+      const replyToken = replyTokens.issue(params.target);
+      const promptLines = [
+        `[QQ c2c message]`,
+        ...(botId ? [`botId: ${botId}`] : []),
+        `peerId: ${params.target.targetId}`,
+        `sender: 系统/子工位汇报 (system)`,
+        `replyToken: ${replyToken}`,
+        `workspace: ${sessionDir}`,
+        ...(addDirs.length > 0 ? [`memoryDirs: ${addDirs.join('; ')}`] : []),
+        '',
+        reportBlock,
+      ];
+      const prompt = promptLines.join('\n');
+      const selectedAgentModel = peerPrefs?.model ?? agentModel;
+
+      startTypingKeepAlive(params.target);
+      try {
+        let conversationId: string;
+        let recordedModel = selectedAgentModel;
+        if (existing) {
+          try {
+            await agentApi.sendMessage(existing.conversationId, prompt, { cwd: sessionDir });
+            conversationId = existing.conversationId;
+            recordedModel = existing.model ?? selectedAgentModel;
+          } catch (sendErr) {
+            if (!fallbackOnSendError) {
+              stopTypingKeepAlive('c2c', params.target.targetId);
+              replyTokens.revoke(replyToken);
+              throw sendErr;
+            }
+            logger?.warn(
+              `[bridge] sendMessage failed for ${sessionKey} (${existing.conversationId}), falling back to newConversation: ${
+                sendErr instanceof Error ? sendErr.message : String(sendErr)
+              }`,
+            );
+            conversationId = await agentApi.newConversation(prompt, {
+              ...(selectedAgentModel ? { model: selectedAgentModel } : {}),
+              cwd: sessionDir,
+            });
+          }
+        } else {
+          conversationId = await agentApi.newConversation(prompt, {
+            ...(selectedAgentModel ? { model: selectedAgentModel } : {}),
+            cwd: sessionDir,
+          });
+        }
+
+        sessionStore.upsert({
+          scope: 'c2c',
+          peerId: params.target.targetId,
+          ...(storeBotId ? { botId: storeBotId } : {}),
+          conversationId,
+          workspaceDir: sessionDir,
+          ...(recordedModel ? { model: recordedModel } : {}),
+          lastActiveAt: now(),
+        });
+      } catch (err) {
+        replyTokens.revoke(replyToken);
+        logger?.error(
+          `[bridge:agentapi] Failed to dispatch subagent report to desktop session: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      } finally {
+        stopTypingKeepAlive('c2c', params.target.targetId);
+      }
+    });
+  };
+
   const launchDelegatedSubagent = (params: DelegateTaskParams): { taskId: string; acceptedAt: number } => {
     subtaskCounter += 1;
     const taskId = `subtask-${subtaskCounter}`;
@@ -568,15 +816,15 @@ export function createAntigravityBridge(
       `[QQ Background Autonomous Subagent — ${taskId}]`,
       `Task Title: ${params.title}`,
       `Working Directory: ${taskCwd}`,
-      `Media Token: ${params.delegateToken}`,
       ...(memoryDirs && memoryDirs.length > 0 ? [`Memory Directories: ${memoryDirs.join('; ')}`] : []),
       '',
       'Instructions:',
-      '- You are an independent background subagent spawned from the main QQ chat so the main conversation remains non-blocking.',
+      '- You are an independent background data collection & execution worker spawned to serve the Main Session (主会话).',
       '- You have full autonomous tool permissions to research, read/write files, and run commands needed to complete this task thoroughly.',
-      '- Do NOT call `qqbot_reply` or `qqbot_delegate_task` (your final text output will be delivered to QQ automatically by the bridge).',
-      '- If you need to send generated images, screenshots, or output files directly to QQ, call `qqbot_send_media` using `replyToken` = the `Media Token` above and `localPath` = the full local absolute path.',
-      '- End with a concise, mobile-friendly summary of what you accomplished, always citing full local absolute paths (never relative paths) for any created or modified files.',
+      '- 【绝对禁止直接联系用户】严禁调用 `send_message`、`send message`、`qqbot_reply`、`qqbot_send_media` 或任何消息工具直接向 QQ 主人/外部用户发送消息！不得输出针对终端用户的问候口吻、寒暄套话或交互对话。QQ 客户端对 Markdown 复杂语法解析存在严重限制，任何直接发送都将导致格式异常与排版崩溃。',
+      '- 【核心职责：极尽细致的全景数据采集】你的唯一任务是向主会话（Main Session）呈报详尽、客观、无遗漏的一阶全景数据采集报告（Panoramic Data Dossier），供主会话审查并组织最终回复。',
+      '- 报告中必须完整包含：执行全过程的真实事实、命令的标准输出与标准错误（stdout/stderr）、完整的本地绝对路径（严禁相对路径）、所有新建/修改文件的路径与关键 diff、精确度量指标与数值、关键配置行内容、以及客观分析结论。',
+      '- 严禁使用占位符（如 // ... 或 TODO）或模糊概括（如“已完成相关修改”）。所有数据必须 100% 真实、完整、可溯源。',
       '',
       'Task Specification:',
       params.prompt,
@@ -594,23 +842,20 @@ export function createAntigravityBridge(
           signal: controller.signal,
         });
 
-        const reportBody = result.text.trim() || '任务已执行完毕（无额外文本输出）。';
-        const outboundText = `【后台子任务完成 · ${params.title}】\n\n${reportBody}`;
+        const reportBody = result.text.trim() || '（子代理执行完毕，未采集到额外数据）';
         const brief = reportBody.replace(/\s+/g, ' ').slice(0, 200);
         pushCompletedNotice(params.target.targetId, `- [${taskId}] "${params.title}" DONE: ${brief}`);
+        logger?.info(`[bridge:subagent] Completed ${taskId} ("${params.title}")`);
 
-        if (options.onDeliverReply && !controller.signal.aborted) {
-          await options.onDeliverReply({
-            replyToken: params.delegateToken,
-            // Omit stale msgId so QqGateway picks the freshest cached C2C msgId or falls back to proactive push
-            target: {
-              scope: 'c2c',
-              targetId: params.target.targetId,
-            },
-            text: outboundText,
+        if (!controller.signal.aborted) {
+          await reportSubagentResultToMainSession({
+            target: params.target,
+            taskId,
+            title: params.title,
+            success: true,
+            report: reportBody,
           });
         }
-        logger?.info(`[bridge:subagent] Completed ${taskId} ("${params.title}")`);
       } catch (err) {
         if (controller.signal.aborted) {
           return;
@@ -619,18 +864,20 @@ export function createAntigravityBridge(
         logger?.error(`[bridge:subagent] ${taskId} ("${params.title}") failed: ${errMsg}`);
         pushCompletedNotice(params.target.targetId, `- [${taskId}] "${params.title}" FAILED: ${errMsg.slice(0, 160)}`);
 
-        if (options.onDeliverReply) {
-          await Promise.resolve(
-            options.onDeliverReply({
-              replyToken: params.delegateToken,
-              target: {
-                scope: 'c2c',
-                targetId: params.target.targetId,
-              },
-              text: `【后台子任务异常 · ${params.title}】\n\n执行中断：${errMsg}`,
-            }),
-          ).catch(() => undefined);
-        }
+        await reportSubagentResultToMainSession({
+          target: params.target,
+          taskId,
+          title: params.title,
+          success: false,
+          report: '',
+          error: errMsg,
+        }).catch((reportErr) => {
+          logger?.error(
+            `[bridge:subagent] Failed to report subagent error to main session: ${
+              reportErr instanceof Error ? reportErr.message : String(reportErr)
+            }`,
+          );
+        });
       } finally {
         activeSubtasks.delete(taskId);
       }
@@ -1137,21 +1384,6 @@ export function createAntigravityBridge(
       now,
       logger,
     });
-
-  const dispatchQueues = new Map<string, Promise<unknown>>();
-
-  function runSerialized<T>(key: string, task: () => Promise<T>): Promise<T> {
-    const previous = dispatchQueues.get(key) ?? Promise.resolve();
-    const current = previous.catch(() => undefined).then(task);
-    const tail = current.catch(() => undefined);
-    dispatchQueues.set(key, tail);
-    void tail.finally(() => {
-      if (dispatchQueues.get(key) === tail) {
-        dispatchQueues.delete(key);
-      }
-    });
-    return current;
-  }
 
   return {
     async start(): Promise<void> {
